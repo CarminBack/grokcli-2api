@@ -857,8 +857,20 @@
               <input id="reg-domain" />
             </div>
             <div>
-              <label>有效期（毫秒，可选）</label>
-              <input id="reg-expiry-ms" type="number" min="60000" max="86400000" inputmode="numeric" />
+              <label>有效期（可选）</label>
+              <select id="reg-expiry-ms">
+                <option value="">默认（1 小时）</option>
+                <option value="300000">5 分钟</option>
+                <option value="600000">10 分钟</option>
+                <option value="900000">15 分钟</option>
+                <option value="1800000">30 分钟</option>
+                <option value="3600000">1 小时</option>
+                <option value="7200000">2 小时</option>
+                <option value="14400000">4 小时</option>
+                <option value="21600000">6 小时</option>
+                <option value="43200000">12 小时</option>
+                <option value="86400000">24 小时</option>
+              </select>
             </div>
             <div>
               <label>MoeMail API Key（可选覆盖）</label>
@@ -1902,12 +1914,36 @@ function readRegConfig() {
     stagger_ms: $("reg-stagger-ms") ? $("reg-stagger-ms").value.trim() : "400",
   };
 }
+function normalizeRegExpiryMs(value) {
+  const allowed = new Set([
+    "", "300000", "600000", "900000", "1800000", "3600000",
+    "7200000", "14400000", "21600000", "43200000", "86400000",
+  ]);
+  const raw = value == null ? "" : String(value).trim();
+  if (!raw) return "";
+  if (allowed.has(raw)) return raw;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n <= 0) return "";
+  // Map legacy free-form ms values to the nearest preset.
+  const presets = [300000, 600000, 900000, 1800000, 3600000, 7200000, 14400000, 21600000, 43200000, 86400000];
+  let best = presets[0];
+  let bestDiff = Math.abs(n - best);
+  for (const p of presets) {
+    const d = Math.abs(n - p);
+    if (d < bestDiff) {
+      best = p;
+      bestDiff = d;
+    }
+  }
+  return String(best);
+}
+
 function applyRegConfig(cfg) {
   if (!cfg || typeof cfg !== "object") return;
   if ($("reg-base-url")) $("reg-base-url").value = cfg.base_url || "";
   if ($("reg-prefix")) $("reg-prefix").value = cfg.prefix || "";
   if ($("reg-domain")) $("reg-domain").value = cfg.domain || "";
-  if ($("reg-expiry-ms")) $("reg-expiry-ms").value = cfg.expiry_ms || "";
+  if ($("reg-expiry-ms")) $("reg-expiry-ms").value = normalizeRegExpiryMs(cfg.expiry_ms);
   if ($("reg-api-key")) $("reg-api-key").value = cfg.api_key || "";
   if ($("reg-yescaptcha-key")) $("reg-yescaptcha-key").value = cfg.yescaptcha_key || "";
   if ($("reg-proxy")) $("reg-proxy").value = cfg.proxy || "";
@@ -1931,7 +1967,8 @@ function buildRegBody(config) {
   if (config.base_url) body.base_url = config.base_url;
   if (config.prefix) body.prefix = config.prefix;
   if (config.domain) body.domain = config.domain;
-  if (config.expiry_ms) body.expiry_ms = Number.parseInt(config.expiry_ms, 10);
+  const expiryMs = normalizeRegExpiryMs(config.expiry_ms);
+  if (expiryMs) body.expiry_ms = Number.parseInt(expiryMs, 10);
   if (config.api_key) body.api_key = config.api_key;
   if (config.yescaptcha_key) body.yescaptcha_key = config.yescaptcha_key;
   if (config.proxy) body.proxy = config.proxy;
