@@ -2,14 +2,14 @@
 
 把 **Grok OIDC 登录态** 转成 **OpenAI / Anthropic 兼容 API**，并附带 Web 管理台：多 API Key、多账号轮询、设备码 / SSO / JSON 导入导出、协议注册。
 
-**当前版本：v1.9.70** · 自动 prompt_cache_key · sub2api 终态帧 · 断联明细
+**当前版本：v1.9.71** · 测活才解冷却 · 自动 prompt_cache_key · sub2api 终态帧
 
 [![GHCR](https://img.shields.io/badge/ghcr.io-hm2899%2Fgrokcli--2api-blue)](https://github.com/users/HM2899/packages/container/package/grokcli-2api)
 [![Release](https://img.shields.io/github/v/release/HM2899/grokcli-2api?display_name=tag)](https://github.com/HM2899/grokcli-2api/releases)
 
 | 镜像（全小写） | 说明 |
 |----------------|------|
-| `ghcr.io/hm2899/grokcli-2api:1.9.70` | 当前版本 |
+| `ghcr.io/hm2899/grokcli-2api:1.9.71` | 当前版本 |
 | `ghcr.io/hm2899/grokcli-2api:latest` | 最近 `v*` tag |
 | `ghcr.io/hm2899/grokcli-2api:edge` | `main` 最新 |
 
@@ -139,7 +139,7 @@ ghcr.io/hm2899/grokcli-2api
 **正确示例：**
 
 ```bash
-docker pull ghcr.io/hm2899/grokcli-2api:1.9.70
+docker pull ghcr.io/hm2899/grokcli-2api:1.9.71
 # 或
 docker pull ghcr.io/hm2899/grokcli-2api:latest
 ```
@@ -178,7 +178,7 @@ services:
       retries: 10
 
   grokcli-2api:
-    image: ghcr.io/hm2899/grokcli-2api:1.9.70
+    image: ghcr.io/hm2899/grokcli-2api:1.9.71
     ports:
       # 只映射应用；不要给 postgres/redis 加 ports
       - "3000:3000"
@@ -416,7 +416,7 @@ gh run list --workflow=docker-publish.yml --limit 3
 成功后拉取（**必须小写**）：
 
 ```bash
-docker pull ghcr.io/hm2899/grokcli-2api:1.9.70
+docker pull ghcr.io/hm2899/grokcli-2api:1.9.71
 docker pull ghcr.io/hm2899/grokcli-2api:latest
 ```
 
@@ -457,7 +457,10 @@ docker-compose.yml                    # redis + postgres（内网）+ app
 
 ## 版本
 
-- **v1.9.70**（当前）
+- **v1.9.71**（当前）
+  - **严格冷却恢复**：请求失败进入冷却后不再按时间自动恢复，仅测活成功或管理台手动解除才回池
+  - 继承 v1.9.70：自动 prompt_cache_key、sub2api 终态帧
+- **v1.9.70**
   - **自动 prompt_cache_key**：客户端未传时按 conversation / previous_response_id / session 生成稳定 key，并在响应 body/header 回传（`prompt_cache_key` / `X-Grok2API-Prompt-Cache-Key`）
   - 响应链绑定保存 minted key，仅带 `previous_response_id` 的下一轮也能恢复同一 sticky key
   - 继承 v1.9.69：sub2api 终态帧修复、空 200 冷却降敏
@@ -525,7 +528,7 @@ docker-compose.yml                    # redis + postgres（内网）+ app
 - **v1.9.45–1.9.38**：YYDS 域名、任务日志、JSON/SSO 进度、内联 hybrid 等
 - 更早变更见 [GitHub Releases](https://github.com/HM2899/grokcli-2api/releases)
 
-> 镜像 tag 与 `app.py` 中 `APP_VERSION` 一致（当前 **1.9.70**）。  
+> 镜像 tag 与 `app.py` 中 `APP_VERSION` 一致（当前 **1.9.71**）。  
 > 拉取路径固定 **`ghcr.io/hm2899/grokcli-2api`**（全小写）。
 
 ## License

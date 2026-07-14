@@ -84,11 +84,18 @@ PROBE_FAIL_DISABLE_STREAK = 4
 PROBE_KICK_COOLDOWN_SEC = 600.0
 # free-usage (rolling 24h) recovery knobs.
 # Base wait after first free-usage hit; grows with stack but hard-capped so
-# accounts do not stay "cooling" forever after cooldown_until expires.
+# cooldown holds until the next successful model probe (strict recovery).
 FREE_USAGE_COOLDOWN_BASE_SEC = 900.0   # 15m first hit
 FREE_USAGE_COOLDOWN_MAX_SEC = 3600.0   # 1h hard cap (rolling windows recover)
 FREE_USAGE_STACK_MAX = 4              # stop stacking past this; just refresh until
 FREE_USAGE_RESTACK_MIN_SEC = 120.0    # ignore duplicate free-usage within this window
+# Strict recovery policy (operator rule):
+# live/request failure → enter cooldown and STAY cooling until the next
+# successful model probe (测活) or an explicit admin clear.
+# Wall-clock cooldown_until is only a UI/Redis marker; it must NOT auto-recover.
+PROBE_ONLY_COOLDOWN_RECOVERY = True
+# Far-future marker so "remaining" UIs and Redis TTL still show cooling.
+PROBE_HOLD_COOLDOWN_SEC = 365.0 * 24.0 * 3600.0
 
 _lock = threading.RLock()
 _rr_index = 0
@@ -222,10 +229,10 @@ def apply_free_usage_cooldown(
 
     Design goals (large free-tier pools):
     - Decision reference is the free-usage-exhausted payload.
-    - Cooldown is time-bounded (``cooldown_until``); once expired, account is
-      eligible again even before the next successful probe.
+    - Under PROBE_ONLY_COOLDOWN_RECOVERY, cooldown holds until the next
+      successful model probe (or admin clear). Wall-clock alone never recovers.
     - Duplicate free-usage hits inside FREE_USAGE_RESTACK_MIN_SEC only refresh
-      the remaining TTL instead of stacking forever.
+      the remaining marker instead of stacking forever.
     - Successful probe still clears stack → normal immediately.
     """
     if not account_id:
@@ -303,11 +310,19 @@ def apply_free_usage_cooldown(
         new_count = max(1, min(int(FREE_USAGE_STACK_MAX), prev_count or 1))
 
     ttl = _free_usage_cooldown_ttl(new_count)
-    # If already cooling, never shorten remaining wait; only extend up to cap.
-    until = now + ttl
-    if still_active and until_existing is not None:
-        until = max(until_existing, min(now + float(FREE_USAGE_COOLDOWN_MAX_SEC), until))
-    reason = str(parsed.get("reason") or "临时额度耗尽，已冷却，等待自动恢复/测活成功")[:300]
+    if PROBE_ONLY_COOLDOWN_RECOVERY:
+        # Free-usage also holds until probe success (not wall-clock auto recover).
+        ttl = float(PROBE_HOLD_COOLDOWN_SEC)
+        until = now + ttl
+        if still_active and until_existing is not None:
+            until = max(until_existing, until)
+        reason = str(parsed.get("reason") or "临时额度耗尽，已冷却，等待下次测活成功")[:300]
+    else:
+        # If already cooling, never shorten remaining wait; only extend up to cap.
+        until = now + ttl
+        if still_active and until_existing is not None:
+            until = max(until_existing, min(now + float(FREE_USAGE_COOLDOWN_MAX_SEC), until))
+        reason = str(parsed.get("reason") or "临时额度耗尽，已冷却，等待自动恢复/测活成功")[:300]
     patch: dict[str, Any] = {
         "pool_status": "cooldown",
         "cooldown_count": new_count,
@@ -722,19 +737,34 @@ def is_model_blocked(
 
 
 def is_in_cooldown(meta: dict[str, Any]) -> bool:
-    """True while this account is still inside an active cooldown window.
+    """True while this account must stay out of live rotation.
 
-    Free-tier policy (operator rule):
-      - free-usage-exhausted → enter cooldown with cooldown_until
-      - model probe success → clear cooldown / re-enter pool
-      - wall-clock until is the only durable skip signal
+    Operator rule (strict):
+      - live/request failure → enter cooldown
+      - stay cooling until the next successful **model probe** (测活)
+      - ordinary chat success must never recover the account
+      - wall-clock ``cooldown_until`` is only a UI/Redis marker under
+        ``PROBE_ONLY_COOLDOWN_RECOVERY``; clock expiry alone does not recover
 
-    Stack / count / pool_status alone must NOT keep an account ineligible after
-    the TTL expires (or when until is missing). Missing until is treated as
-    eligible so the next probe can re-evaluate free usage.
+    Recovery paths:
+      1. successful model probe
+      2. admin clear / manual enable
     """
     if not isinstance(meta, dict):
         return False
+    # Durable cooling flags first (probe-only recovery).
+    try:
+        if int(meta.get("cooldown_count") or 0) > 0:
+            return True
+    except (TypeError, ValueError):
+        pass
+    stack = meta.get("status_stack")
+    if isinstance(stack, list) and len(stack) > 0:
+        return True
+    status = str(meta.get("pool_status") or "").strip().lower()
+    if status == "cooldown":
+        return True
+    # Backward-compatible time window (and non-strict mode).
     until = meta.get("cooldown_until")
     if until is None:
         return False
@@ -745,11 +775,13 @@ def is_in_cooldown(meta: dict[str, Any]) -> bool:
 
 
 def maybe_expire_cooldown(account_id: str, meta: dict[str, Any] | None = None) -> dict[str, Any] | None:
-    """If cooldown_until elapsed, clear durable free-usage/cooldown markers.
+    """Legacy helper: used to clear cooldowns when cooldown_until elapsed.
 
-    Returns updated meta summary when a clear happened, else None.
-    Safe to call on hot paths (single-account patch only).
+    Under ``PROBE_ONLY_COOLDOWN_RECOVERY`` this is a no-op — only a successful
+    model probe (or admin clear) may re-enter the account into rotation.
     """
+    if PROBE_ONLY_COOLDOWN_RECOVERY:
+        return None
     if not account_id:
         return None
     if meta is None:
@@ -850,7 +882,13 @@ def stack_cooldown_until(
 
 
 def prune_expired_cooldowns(account_id: str | None = None) -> int:
-    """Clear durable cooldown_until that already elapsed. Returns cleared count."""
+    """Legacy wall-clock prune. Disabled under probe-only recovery.
+
+    Returns 0 always when ``PROBE_ONLY_COOLDOWN_RECOVERY`` is on so background
+    status polls cannot re-admit failed accounts without a successful probe.
+    """
+    if PROBE_ONLY_COOLDOWN_RECOVERY:
+        return 0
     state = get_account_pool_state()
     now = _now()
     cleared = 0
@@ -953,28 +991,31 @@ def _eligible(
     # Active wall-clock cooldown still running → skip.
     if is_in_cooldown(meta):
         return False
-    # TTL elapsed (or no active until) but durable stack leftovers remain:
-    # lazily clear so pool_status/count stay accurate for admin UI.
-    try:
-        until = meta.get("cooldown_until")
-        leftover = (
-            int(meta.get("cooldown_count") or 0) > 0
-            or (
-                isinstance(meta.get("status_stack"), list)
-                and len(meta.get("status_stack") or []) > 0
+    # Under probe-only recovery, never auto-clear durable cooling leftovers
+    # just because cooldown_until elapsed. Probe success / admin clear only.
+    if not PROBE_ONLY_COOLDOWN_RECOVERY:
+        # TTL elapsed (or no active until) but durable stack leftovers remain:
+        # lazily clear so pool_status/count stay accurate for admin UI.
+        try:
+            until = meta.get("cooldown_until")
+            leftover = (
+                int(meta.get("cooldown_count") or 0) > 0
+                or (
+                    isinstance(meta.get("status_stack"), list)
+                    and len(meta.get("status_stack") or []) > 0
+                )
+                or str(meta.get("pool_status") or "") == "cooldown"
             )
-            or str(meta.get("pool_status") or "") == "cooldown"
-        )
-        if leftover and (
-            until is None
-            or (until is not None and _now() >= float(until))
-        ):
-            # Only auto-clear when until is present and elapsed. Bare stack
-            # without until stays until probe/manual (legacy safety).
-            if until is not None and _now() >= float(until):
-                maybe_expire_cooldown(aid, meta)
-    except Exception:
-        pass
+            if leftover and (
+                until is None
+                or (until is not None and _now() >= float(until))
+            ):
+                # Only auto-clear when until is present and elapsed. Bare stack
+                # without until stays until probe/manual (legacy safety).
+                if until is not None and _now() >= float(until):
+                    maybe_expire_cooldown(aid, meta)
+        except Exception:
+            pass
     if model and is_model_blocked(aid, model, state, meta=meta):
         return False
     return True
@@ -1400,12 +1441,18 @@ def report_failure(
     }
     stack = stack_status_entry(meta, entry)
     new_count = len(stack)
-    if empty_upstream:
+    if PROBE_ONLY_COOLDOWN_RECOVERY:
+        # Stay cooling until the next successful probe. Keep a far-future
+        # until marker so UI remaining-time / Redis hot keys stay "cooling".
+        base = float(PROBE_HOLD_COOLDOWN_SEC)
+        until = _now() + base
+    elif empty_upstream:
         # Short sticky skip only (8–20s), ignore stack multiplier.
         base = max(8.0, min(float(cooldown or 12.0), 20.0))
         until = _now() + base
     else:
-        until = _now() + max(float(cooldown or 60.0), 60.0) * max(1, new_count)
+        base = max(float(cooldown or 60.0), 60.0) * max(1, new_count)
+        until = _now() + base
     err_store = (error or "")[:300]
     if err_store.startswith("{") and len(err_store) > 160:
         err_store = err_store[:160] + "…"
@@ -1417,7 +1464,7 @@ def report_failure(
                 "cooldown_count": new_count,
                 "pool_status": "cooldown",
                 "cooldown_until": until,
-                "cooldown_sec": float(new_count if not empty_upstream else base),
+                "cooldown_sec": float(new_count),
                 "cooldown_reason": err_store,
                 "cooldown_code": entry["code"],
                 "cooldown_model": model,
@@ -1439,7 +1486,7 @@ def report_failure(
         cooldown_until=until,
         consecutive_fails=streak,
         last_status_code=status_code,
-        cooldown_sec=float(new_count if not empty_upstream else base),
+        cooldown_sec=float(new_count),
     )
     print(
         f"  [pool] live fail → cooldown account={account_id[:48]} "
@@ -1773,9 +1820,18 @@ def reenable_for_quota(
 def expire_due_cooldowns(*, limit: int = 200) -> dict[str, Any]:
     """Batch-clear accounts whose cooldown_until has elapsed.
 
-    Used by model_health / token maintainer background ticks so pool_status
-    does not stay 'cooldown' after the free-usage window ends.
+    Disabled under ``PROBE_ONLY_COOLDOWN_RECOVERY``: cooldown recovery is
+    probe-success only (or admin clear). Background ticks must not re-admit.
     """
+    if PROBE_ONLY_COOLDOWN_RECOVERY:
+        return {
+            "ok": True,
+            "cleared": 0,
+            "scanned": 0,
+            "errors": 0,
+            "backend": "probe_only",
+            "skipped": True,
+        }
     cleared = 0
     scanned = 0
     errors = 0
@@ -2451,7 +2507,10 @@ def kick_from_pool(
     if cooldown_sec and float(cooldown_sec) > 0:
         meta0 = _pool_meta(account_id, {account_id: get_account_pool_meta(account_id)})
         new_count = stack_cooldown_count(meta0, add=1)
-        until = _now() + max(float(cooldown_sec), 60.0) * max(1, new_count)
+        if PROBE_ONLY_COOLDOWN_RECOVERY:
+            until = _now() + float(PROBE_HOLD_COOLDOWN_SEC)
+        else:
+            until = _now() + max(float(cooldown_sec), 60.0) * max(1, new_count)
         # Durable PG meta bound to this account_id: stack count, not replace time.
         try:
             patch_account_pool_meta(
@@ -2674,7 +2733,10 @@ def record_model_probe_outcome(
         }
         stack = stack_status_entry(meta, entry)
         new_count = len(stack)
-        until = _now() + float(kick_cd) * max(1, new_count)
+        if PROBE_ONLY_COOLDOWN_RECOVERY:
+            until = _now() + float(PROBE_HOLD_COOLDOWN_SEC)
+        else:
+            until = _now() + float(kick_cd) * max(1, new_count)
         patch_fail.update(
             {
                 "status_stack": stack,
