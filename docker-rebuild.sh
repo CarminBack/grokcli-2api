@@ -22,13 +22,16 @@ fi
 
 echo "== local fingerprint =="
 python3 -c 'from pathlib import Path; import re
-adapter = Path("grok_build_adapter.py").read_text(encoding="utf-8")
-app = Path("app.py").read_text(encoding="utf-8")
+adapter_path = Path("grok2api/upstream/grok_build_adapter.py")
+app_path = Path("grok2api/app.py")
+adapter = adapter_path.read_text(encoding="utf-8")
+app = app_path.read_text(encoding="utf-8")
 m1 = re.search(r"ADAPTER_BUILD\s*=\s*\"([^\"]+)\"", adapter)
 m2 = re.search(r"APP_VERSION\s*=\s*\"([^\"]+)\"", app)
 print("ADAPTER_BUILD=", m1.group(1) if m1 else None)
 print("APP_VERSION=", m2.group(1) if m2 else None)
-print("adapter_present=", Path("grok_build_adapter.py").exists())
+print("adapter_present=", adapter_path.exists())
+print("app_package_present=", app_path.exists())
 print("engine_dir_present=", Path("grok-build-auth/xconsole_client").exists())
 '
 

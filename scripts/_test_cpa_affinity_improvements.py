@@ -31,7 +31,7 @@ os.environ["GROK2API_CONVERSATION_AFFINITY"] = "1"
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-import conversation_affinity as aff  # noqa: E402
+from grok2api.pool import conversation_affinity as aff  # noqa: E402
 
 # Force pure in-process map for unit tests (ignore host .env Redis).
 aff._redis_mode = lambda: False  # type: ignore[assignment]

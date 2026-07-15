@@ -20,7 +20,7 @@ os.environ["GROK2API_AFFINITY_FILE"] = str(Path(_tmp) / "affinity.json")
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-import account_pool as ap  # noqa: E402
+from grok2api.pool import account_pool as ap  # noqa: E402
 
 
 def ok(cond: bool, msg: str) -> None:

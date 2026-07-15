@@ -29,8 +29,8 @@ def _parse_sse(frames: list[str]) -> list[dict]:
 
 
 def main() -> int:
-    import anthropic_compat as a
-    import openai_responses as o
+    from grok2api.protocol import anthropic_compat as a
+    from grok2api.protocol import openai_responses as o
 
     print("=== tool readiness ===")
     cases = [
@@ -325,7 +325,7 @@ def test_update_file_path_beats_path_alias():
     canonical file_path and the later key is only path).
     """
     import json
-    import anthropic_compat as anth
+    from grok2api.protocol import anthropic_compat as anth
 
     # 1) Single object: alias first, then canonical (same value) → keep file_path
     n_same = anth.normalize_tool_argument_keys(
@@ -444,7 +444,7 @@ def test_update_file_path_beats_path_alias():
     assert n3.get("file_path") == "/only-alias", n3
 
     # 7) openai_responses local mirror agrees
-    import openai_responses as oresp
+    from grok2api.protocol import openai_responses as oresp
     ln = oresp._local_normalize_tool_arg_keys(
         {"path": "/wrong", "file_path": "/correct"}
     )
@@ -487,8 +487,8 @@ def test_update_to_edit_remap_all_paths():
     must rewrite Update→Edit. Empty allow-list still remaps (sub2api often
     fails to forward the tools array).
     """
-    import anthropic_compat as anth
-    import openai_responses as oresp
+    from grok2api.protocol import anthropic_compat as anth
+    from grok2api.protocol import openai_responses as oresp
 
     # 1) pure remapper
     assert anth.canonical_outbound_tool_name("Update", allowed_names=None) == "Edit"
@@ -662,9 +662,9 @@ def test_soft_disconnect_does_not_drop_body_frames():
     Code hard-cut ("stream interrupted").
     """
     import asyncio
-    import app as application
-    import openai_responses as oresp
-    import anthropic_compat as anth
+    import grok2api.app as application
+    from grok2api.protocol import openai_responses as oresp
+    from grok2api.protocol import anthropic_compat as anth
 
     full_args = (
         '{"file_path":"/tmp/x.py","old_string":"old","new_string":"new"}'

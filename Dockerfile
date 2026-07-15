@@ -80,9 +80,11 @@ COPY . /app
 RUN chmod +x /app/entrypoint.sh \
     && mkdir -p /app/turnstile-solver/logs /app/turnstile-solver/keys \
     && test -f /app/grok-build-auth/xconsole_client/client.py \
-    && test -f /app/grok_build_adapter.py \
+    && test -f /app/grok2api/app.py \
+    && test -f /app/grok2api/upstream/grok_build_adapter.py \
+    && test -f /app/app.py \
     && test -f /app/turnstile-solver/api_solver.py \
-    && python -c "import grok_build_adapter, app; print('build-check', app.APP_VERSION, grok_build_adapter.ADAPTER_BUILD)"
+    && python -c "import app; import grok2api.app as pkg_app; from grok2api.upstream import grok_build_adapter; print('build-check', pkg_app.APP_VERSION, grok_build_adapter.ADAPTER_BUILD, app.APP_VERSION)"
 
 EXPOSE 3000 5072
 
