@@ -738,6 +738,44 @@ def registration_available() -> dict[str, Any]:
         moemail_configured = moemail_configured or bool(_cfg_moemail)
     except Exception:
         pass
+    # vwhmail / catch-all temp-mail needs base URL + domain, not a real API key.
+    try:
+        mail_prov = (
+            os.environ.get("GROK2API_MAIL_PROVIDER")
+            or os.environ.get("MAIL_PROVIDER")
+            or ""
+        ).strip().lower()
+        if mail_prov in {"vwhmail", "vwh"}:
+            base = (
+                os.environ.get("GROK2API_MOEMAIL_BASE_URL")
+                or os.environ.get("MOEMAIL_BASE_URL")
+                or ""
+            ).strip()
+            domain = (
+                os.environ.get("GROK2API_MOEMAIL_DOMAIN")
+                or os.environ.get("MOEMAIL_DOMAIN")
+                or ""
+            ).strip()
+            if base or domain:
+                moemail_configured = True
+        try:
+            from settings_store import get_registration_config
+
+            _rc = get_registration_config(include_secrets=True)
+            _mp = str(_rc.get("mail_provider") or "").strip().lower()
+            if _mp == "vwhmail" and (
+                _rc.get("base_url")
+                or _rc.get("moemail_base_url")
+                or _rc.get("domain")
+                or _rc.get("moemail_domain")
+            ):
+                moemail_configured = True
+            elif _rc.get("api_key") or _rc.get("moemail_api_key"):
+                moemail_configured = True
+        except Exception:
+            pass
+    except Exception:
+        pass
     provider = (
         CAPTCHA_PROVIDER
         or os.environ.get("GROK2API_CAPTCHA_PROVIDER")
@@ -818,14 +856,16 @@ def _make_email_receiver(
     from config import MOEMAIL_API_KEY, MOEMAIL_BASE_URL, MOEMAIL_DOMAIN, MOEMAIL_EXPIRY_MS
 
     key = (api_key or MOEMAIL_API_KEY or "").strip()
-    if not key:
+    base = (base_url or MOEMAIL_BASE_URL).rstrip("/")
+    prov = normalize_mail_provider(mail_provider, base_url=base)
+    # vwhmail catch-all is open (no API key). Other providers still require key.
+    if not key and prov != "vwhmail":
         raise ValueError(
             "Mail API key missing. Set GROK2API_MOEMAIL_API_KEY or pass api_key."
         )
-    base = (base_url or MOEMAIL_BASE_URL).rstrip("/")
-    prov = normalize_mail_provider(mail_provider, base_url=base)
     # YYDS/GPTMail/CFMail: empty domain means provider-side auto/random pick.
     # Never bleed MoeMail's MOEMAIL_DOMAIN (default example.com) into them.
+    # vwhmail: prefer explicit domain / MOEMAIL_DOMAIN (e.g. mewinyou.shop).
     if prov in {"yyds", "gptmail", "cfmail"}:
         dom = (domain or "").strip().lstrip("@").strip(".")
     else:
@@ -866,6 +906,8 @@ def _make_email_receiver(
                 default_base = "https://mail.chatgpt.org.uk"
             elif provider == "cfmail":
                 default_base = "https://temp-email-api.awsl.uk"
+            elif provider == "vwhmail":
+                default_base = "https://temp-mail.supermewinyou.workers.dev"
             else:
                 default_base = "https://moemail.521884.xyz"
             self.base_url = base_url or default_base

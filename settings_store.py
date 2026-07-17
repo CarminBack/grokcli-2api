@@ -1668,6 +1668,8 @@ def _normalize_registration_config(
             cfg["mail_provider"] = "yyds"
         elif mail_raw in {"gptmail", "gpt-mail", "chatgptmail"}:
             cfg["mail_provider"] = "gptmail"
+        elif mail_raw in {"vwhmail", "vwh", "custom_domain", "custom-domain"}:
+            cfg["mail_provider"] = "vwhmail"
         elif mail_raw in {"cfmail", "cloudflare", "cloudflare_temp_email", "awsl"}:
             cfg["mail_provider"] = "cfmail"
         else:
@@ -1715,6 +1717,21 @@ def _normalize_registration_config(
         cfg["mail_provider"], "moemail_api_key"
     )
     cfg["api_key"] = str(cfg.get(active_slot) or "").strip()
+    if cfg.get("mail_provider") == "vwhmail":
+        # Open catch-all: no real secret; keep a non-empty marker so UI "configured" works.
+        if not cfg.get("api_key"):
+            cfg["api_key"] = "vwhmail-open"
+        # Prefer moemail base/domain slots for self-hosted URL + custom domain.
+        if not cfg.get("base_url"):
+            cfg["base_url"] = str(cfg.get("moemail_base_url") or "").strip()
+        if cfg.get("base_url"):
+            cfg["moemail_base_url"] = str(cfg["base_url"]).strip().rstrip("/")
+            cfg["base_url"] = cfg["moemail_base_url"]
+        if not cfg.get("domain"):
+            cfg["domain"] = str(cfg.get("moemail_domain") or "").strip()
+        if cfg.get("domain"):
+            cfg["moemail_domain"] = str(cfg["domain"]).strip()
+
 
     # Active domain mirrors the selected provider (adapter reads domain).
     active_dom_slot = _MAIL_PROVIDER_DOMAIN_FIELDS.get(
@@ -1799,7 +1816,7 @@ def _normalize_registration_config(
         # nearest timed preset
         timed = (3600000, 86400000, 259200000)
         expiry = min(timed, key=lambda p: abs(p - expiry))
-    if cfg["mail_provider"] in {"yyds", "gptmail"}:
+    if cfg["mail_provider"] in {"yyds", "gptmail", "vwhmail"}:
         # YYDS / GPTMail temp inboxes auto-expire ~24h; permanent/3d not meaningful.
         if expiry in (0, 259200000):
             expiry = 86400000
@@ -1861,13 +1878,17 @@ def get_registration_config(*, include_secrets: bool = True) -> dict[str, Any]:
     has_yyds = bool(cfg.get("yyds_api_key"))
     has_gpt = bool(cfg.get("gptmail_api_key"))
     has_cf = bool(cfg.get("cfmail_api_key"))
-    has_active = bool(cfg.get("api_key"))
+    has_vwh = mail_provider == "vwhmail" and bool(
+        cfg.get("base_url") or cfg.get("moemail_base_url") or cfg.get("domain") or cfg.get("moemail_domain")
+    )
+    has_active = bool(cfg.get("api_key")) or has_vwh
     public["configured"] = {
         "moemail": has_moemail,
         "yyds": has_yyds,
         "gptmail": has_gpt,
         "cfmail": has_cf,
-        "mail": has_active or has_moemail or has_yyds or has_gpt or has_cf,
+        "vwhmail": has_vwh,
+        "mail": has_active or has_moemail or has_yyds or has_gpt or has_cf or has_vwh,
         "yescaptcha": bool(cfg.get("yescaptcha_key")),
         "local_solver": bool(cfg.get("local_solver_url")),
         "captcha": (

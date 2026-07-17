@@ -9,6 +9,7 @@ Providers:
   - yyds     — vip.215.im / maliapi.215.im YYDS Mail (``/v1/accounts`` …)
   - gptmail  — mail.chatgpt.org.uk GPTMail (``/api/generate-email`` …)
   - cfmail   — dreamhunter2333/cloudflare_temp_email (``/api/new_address`` …)
+  - vwhmail  — vwh/temp-mail catch-all (``/domains`` + ``/emails/{addr}`` + ``/inbox/{id}``)
 """
 from __future__ import annotations
 
@@ -53,7 +54,7 @@ def _headers(api_key: str | None = None) -> dict[str, str]:
 
 
 def normalize_mail_provider(provider: str | None, *, base_url: str | None = None) -> str:
-    """Return ``moemail`` | ``yyds`` | ``gptmail`` | ``cfmail``.
+    """Return ``moemail`` | ``yyds`` | ``gptmail`` | ``cfmail`` | ``vwhmail``.
 
     Infer from base_url when provider is empty.
     """
@@ -70,6 +71,17 @@ def normalize_mail_provider(provider: str | None, *, base_url: str | None = None
         "chatgpt.org.uk",
     }:
         return "gptmail"
+    if p in {
+        "vwhmail",
+        "vwh",
+        "vwh-mail",
+        "vwh_mail",
+        "custom_domain",
+        "custom-domain",
+        "barid",
+        "temp-mail-vwh",
+    }:
+        return "vwhmail"
     if p in {
         "cfmail",
         "cf-mail",
@@ -96,6 +108,15 @@ def normalize_mail_provider(provider: str | None, *, base_url: str | None = None
         )
     ):
         return "gptmail"
+    # vwh/temp-mail catch-all workers (before generic temp-email/cfmail hints)
+    if any(
+        x in base
+        for x in (
+            "supermewinyou.workers.dev",
+            "workers.dev",
+        )
+    ) and "temp-mail" in base:
+        return "vwhmail"
     if any(
         x in base
         for x in (
@@ -1301,6 +1322,169 @@ def cfmail_fetch_messages(
         return out
 
 
+
+def normalize_vwhmail_base_url(base_url: str | None = None) -> str:
+    """Normalize vwh/temp-mail origin (no trailing slash)."""
+    raw = (base_url or MOEMAIL_BASE_URL or "").strip()
+    if not raw:
+        raise ValueError(
+            "vwhmail base URL missing. Set GROK2API_MOEMAIL_BASE_URL "
+            "(e.g. https://temp-mail.example.workers.dev)."
+        )
+    parsed = urlparse(raw if "://" in raw else f"https://{raw}")
+    origin = f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
+    if not parsed.netloc:
+        raise ValueError(f"invalid vwhmail base URL: {raw!r}")
+    return origin
+
+
+def vwhmail_list_domains(
+    *,
+    base_url: str | None = None,
+) -> list[str]:
+    base = normalize_vwhmail_base_url(base_url)
+    try:
+        with httpx.Client(timeout=20.0) as client:
+            resp = client.get(f"{base}/domains")
+            if resp.status_code >= 400:
+                return []
+            data = resp.json() if resp.content else {}
+    except Exception:
+        return []
+    items = data.get("result") if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        return []
+    out: list[str] = []
+    for item in items:
+        if isinstance(item, str) and item.strip():
+            out.append(item.strip().lstrip("@").strip("."))
+        elif isinstance(item, dict):
+            name = item.get("domain") or item.get("name")
+            if isinstance(name, str) and name.strip():
+                out.append(name.strip().lstrip("@").strip("."))
+    return out
+
+
+def vwhmail_create_mailbox(
+    *,
+    name: str | None = None,
+    domain: str | None = None,
+    expiry_ms: int | None = None,
+    api_key: str | None = None,  # unused — open catch-all API
+    base_url: str | None = None,
+    proxy: str | None = None,
+    proxy_username: str | None = None,
+    proxy_password: str | None = None,
+) -> dict[str, Any]:
+    """Create a logical mailbox on vwh/temp-mail (catch-all; no server-side create).
+
+    The service accepts mail for any local-part on configured domains and lists
+    messages via ``GET /emails/{address}``.
+    """
+    base = normalize_vwhmail_base_url(base_url)
+    dom = (domain or MOEMAIL_DOMAIN or "").strip().lstrip("@").strip(".")
+    if not dom:
+        domains = vwhmail_list_domains(base_url=base)
+        if not domains:
+            raise ValueError(
+                "vwhmail domain missing and /domains returned empty. "
+                "Set GROK2API_MOEMAIL_DOMAIN (e.g. mewinyou.shop)."
+            )
+        preferred = [d for d in domains if d not in {"barid.site", "vwh.sh"}]
+        dom = (preferred or domains)[0]
+    else:
+        try:
+            domains = vwhmail_list_domains(base_url=base)
+            if domains and dom not in domains:
+                raise ValueError(
+                    f"vwhmail domain {dom!r} not in worker /domains: {domains[:12]}"
+                )
+        except ValueError:
+            raise
+        except Exception:
+            pass
+
+    local = (name or "").strip().lower() or secrets_token_hex_local()
+    local = re.sub(r"[^a-z0-9._+-]", "", local) or secrets_token_hex_local()
+    address = f"{local}@{dom}"
+    return {
+        "id": address,
+        "email": address,
+        "token": address,
+        "provider": "vwhmail",
+        "raw": {"address": address, "domain": dom, "base_url": base},
+        "expiry_ms": 86_400_000 if expiry_ms is None else int(expiry_ms),
+    }
+
+
+def vwhmail_fetch_messages(
+    email_id: str,
+    *,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    include_details: bool = True,
+    address: str | None = None,
+    token: str | None = None,
+) -> list[dict[str, Any]]:
+    """List + optionally detail-fetch messages for a catch-all address."""
+    addr = (address or email_id or token or "").strip()
+    if not addr or "@" not in addr:
+        return []
+    base = normalize_vwhmail_base_url(base_url)
+    encoded = quote(addr, safe="")
+    with httpx.Client(timeout=30.0) as client:
+        resp = client.get(
+            f"{base}/emails/{encoded}",
+            params={"limit": 20, "offset": 0},
+        )
+        if resp.status_code >= 400:
+            raise RuntimeError(
+                f"vwhmail list failed {resp.status_code}: {resp.text[:500]}"
+            )
+        data = resp.json() if resp.content else {}
+        items = data.get("result") if isinstance(data, dict) else data
+        if not isinstance(items, list):
+            return []
+
+        out: list[dict[str, Any]] = []
+        for raw in items[:20]:
+            if not isinstance(raw, dict):
+                continue
+            item = dict(raw)
+            msg_id = item.get("id") or item.get("emailId") or item.get("message_id")
+            if include_details and msg_id:
+                detail = client.get(f"{base}/inbox/{quote(str(msg_id), safe='')}")
+                if detail.status_code == 200:
+                    d = detail.json() if detail.content else {}
+                    body = d.get("result") if isinstance(d, dict) and "result" in d else d
+                    if isinstance(body, dict):
+                        item.update(body)
+            if item.get("from_address") and not item.get("from"):
+                item["from"] = item.get("from_address")
+            if item.get("text_content") and not item.get("text"):
+                item["text"] = item.get("text_content")
+            if item.get("html_content") and not item.get("html"):
+                item["html"] = item.get("html_content")
+            if item.get("text_content") and not item.get("content"):
+                item["content"] = item.get("text_content")
+            text_blob = "\n".join(
+                str(item.get(k) or "")
+                for k in (
+                    "subject",
+                    "content",
+                    "text",
+                    "text_content",
+                    "html",
+                    "html_content",
+                    "from_address",
+                    "from",
+                )
+            )
+            item["extracted"] = _extract_codes_and_links(text_blob)
+            out.append(item)
+        return out
+
+
 def create_mailbox(
     *,
     provider: str | None = None,
@@ -1339,6 +1523,17 @@ def create_mailbox(
         )
     if prov == "cfmail":
         return cfmail_create_mailbox(
+            name=name,
+            domain=domain,
+            expiry_ms=expiry_ms,
+            api_key=api_key,
+            base_url=base_url,
+            proxy=proxy,
+            proxy_username=proxy_username,
+            proxy_password=proxy_password,
+        )
+    if prov == "vwhmail":
+        return vwhmail_create_mailbox(
             name=name,
             domain=domain,
             expiry_ms=expiry_ms,
@@ -1395,6 +1590,15 @@ def fetch_messages(
         )
     if prov == "cfmail":
         return cfmail_fetch_messages(
+            email_id,
+            api_key=api_key,
+            base_url=base_url,
+            include_details=include_details,
+            address=address,
+            token=token,
+        )
+    if prov == "vwhmail":
+        return vwhmail_fetch_messages(
             email_id,
             api_key=api_key,
             base_url=base_url,

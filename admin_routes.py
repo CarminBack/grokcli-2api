@@ -200,12 +200,12 @@ class EmailRegistrationBody(BaseModel):
     # Backward-compat: older clients sent provider=moemail for the mail service.
     provider: str | None = Field(
         default=None,
-        pattern="^(moemail|yyds|gptmail|cfmail)$",
+        pattern="^(moemail|yyds|gptmail|cfmail|vwhmail)$",
         description="Deprecated alias of mail_provider",
     )
     mail_provider: str | None = Field(
         default=None,
-        pattern="^(moemail|yyds|gptmail|cfmail)$",
+        pattern="^(moemail|yyds|gptmail|cfmail|vwhmail)$",
         description="Temp-mail: moemail | yyds | gptmail | cfmail (cloudflare_temp_email)",
     )
     protocol: str = Field(default="grpc", pattern="^grpc$")
@@ -308,7 +308,7 @@ class RegistrationConfigBody(BaseModel):
 
     mail_provider: str | None = Field(
         default=None,
-        pattern="^(moemail|yyds|gptmail|cfmail)$",
+        pattern="^(moemail|yyds|gptmail|cfmail|vwhmail)$",
         description="Temp-mail: moemail | yyds | gptmail | cfmail (cloudflare_temp_email)",
     )
     base_url: str | None = Field(

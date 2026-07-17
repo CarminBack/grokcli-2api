@@ -2594,17 +2594,19 @@ const REG_MAIL_KEY_SLOTS = {
   yyds: "yyds_api_key",
   gptmail: "gptmail_api_key",
   cfmail: "cfmail_api_key",
+  vwhmail: "moemail_api_key",
 };
 const REG_MAIL_DOMAIN_SLOTS = {
   moemail: "moemail_domain",
   yyds: "yyds_domain",
   gptmail: "gptmail_domain",
   cfmail: "cfmail_domain",
+  vwhmail: "moemail_domain",
 };
-let regMailKeys = { moemail: "", yyds: "", gptmail: "", cfmail: "" };
-let regMailDomains = { moemail: "", yyds: "", gptmail: "", cfmail: "" };
+let regMailKeys = { moemail: "", yyds: "", gptmail: "", cfmail: "", vwhmail: "" };
+let regMailDomains = { moemail: "", yyds: "", gptmail: "", cfmail: "", vwhmail: "" };
 // Self-hosted hosts kept per provider so MoeMail / CF never overwrite each other.
-let regMailBaseUrls = { moemail: "", cfmail: "" };
+let regMailBaseUrls = { moemail: "", cfmail: "", vwhmail: "" };
 let regMailProviderPrev = "moemail";
 
 function currentRegMailProvider() {
@@ -2614,6 +2616,7 @@ function currentRegMailProvider() {
   if (mail === "yyds") return "yyds";
   if (mail === "gptmail") return "gptmail";
   if (mail === "cfmail") return "cfmail";
+  if (mail === "vwhmail" || mail === "vwh") return "vwhmail";
   return "moemail";
 }
 
@@ -2625,7 +2628,7 @@ function stashRegMailFieldsFromInput() {
   if ($("reg-domain")) {
     regMailDomains[mail] = $("reg-domain").value || "";
   }
-  if ($("reg-base-url") && (mail === "moemail" || mail === "cfmail")) {
+  if ($("reg-base-url") && (mail === "moemail" || mail === "cfmail" || mail === "vwhmail")) {
     regMailBaseUrls[mail] = $("reg-base-url").value || "";
   }
 }
@@ -2646,23 +2649,29 @@ function syncRegMailProviderUI() {
   const isGpt = mail === "gptmail";
   const isCf = mail === "cfmail";
   const isMoe = mail === "moemail";
+  const isVwh = mail === "vwhmail";
   const isTemp24h = isYyds || isGpt;
+  const isSelfHosted = isMoe || isCf || isVwh;
 
   // YYDS / GPTMail use fixed official hosts — hide URL field entirely.
-  // MoeMail / CF Temp Email are self-hosted — show URL field with per-provider value.
+  // MoeMail / CF / vwhmail are self-hosted — show URL field with per-provider value.
   if ($("reg-base-url-wrap")) {
-    $("reg-base-url-wrap").style.display = (isMoe || isCf) ? "" : "none";
+    $("reg-base-url-wrap").style.display = isSelfHosted ? "" : "none";
   }
   if ($("reg-base-url-label")) {
     $("reg-base-url-label").textContent = isCf
       ? "CF Temp Email Base URL"
-      : "MoeMail Base URL";
+      : isVwh
+        ? "vwhmail Base URL"
+        : "MoeMail Base URL";
   }
   if ($("reg-base-url")) {
-    if (isMoe || isCf) {
+    if (isSelfHosted) {
       $("reg-base-url").placeholder = isCf
         ? "https://your-worker.example.workers.dev"
-        : "https://moemail.example.com";
+        : isVwh
+          ? "https://temp-mail.example.workers.dev"
+          : "https://moemail.example.com";
       // Restore this provider's host only — never the other self-hosted host.
       $("reg-base-url").value = regMailBaseUrls[mail] || "";
     } else {
@@ -2677,7 +2686,9 @@ function syncRegMailProviderUI() {
         ? "GPTMail API Key"
         : isCf
           ? "CF Temp Email Admin 密码"
-          : "MoeMail API Key";
+          : isVwh
+            ? "vwhmail API Key（可留空/占位）"
+            : "MoeMail API Key";
   }
   if ($("reg-api-key")) {
     $("reg-api-key").placeholder = isYyds
@@ -2686,7 +2697,9 @@ function syncRegMailProviderUI() {
         ? "sk-...（自有 Key）"
         : isCf
           ? "管理后台密码（x-admin-auth）"
-          : "mk_...";
+          : isVwh
+            ? "可选；open catch-all 可填 vwhmail-open"
+            : "mk_...";
     // Show the key stored for this provider only.
     $("reg-api-key").value = regMailKeys[mail] || "";
   }
@@ -2697,7 +2710,9 @@ function syncRegMailProviderUI() {
         ? "GPTMail 邮箱域名"
         : isCf
           ? "CF Temp Email 域名"
-          : "MoeMail 邮箱域名";
+          : isVwh
+            ? "vwhmail 邮箱域名"
+            : "MoeMail 邮箱域名";
   }
   if ($("reg-domain")) {
     $("reg-domain").placeholder = isYyds
@@ -2706,7 +2721,9 @@ function syncRegMailProviderUI() {
         ? "可选；留空由 GPTMail 随机分配"
         : isCf
           ? "可选；留空从 /open_api/settings 自动选"
-          : "example.com";
+          : isVwh
+            ? "mewinyou.shop（catch-all 域名）"
+            : "example.com";
     // Show the domain stored for this provider only.
     $("reg-domain").value = regMailDomains[mail] || "";
   }
@@ -2741,11 +2758,11 @@ function readRegConfig() {
   const activeKey = regMailKeys[mailProvider] || "";
   const activeDomain = regMailDomains[mailProvider] || "";
   // Keep self-hosted hosts in dedicated slots so save never mixes them.
-  if (mailProvider === "moemail" || mailProvider === "cfmail") {
+  if (mailProvider === "moemail" || mailProvider === "cfmail" || mailProvider === "vwhmail") {
     regMailBaseUrls[mailProvider] = $("reg-base-url") ? ($("reg-base-url").value || "").trim() : (regMailBaseUrls[mailProvider] || "");
   }
   const activeBase =
-    mailProvider === "moemail" || mailProvider === "cfmail"
+    mailProvider === "moemail" || mailProvider === "cfmail" || mailProvider === "vwhmail"
       ? (regMailBaseUrls[mailProvider] || "")
       : "";
   return {
@@ -2812,7 +2829,7 @@ function normalizeRegExpiryMs(value) {
 function applyRegConfig(cfg) {
   if (!cfg || typeof cfg !== "object") return;
   const mail = String(cfg.mail_provider || cfg.provider || "moemail").trim().toLowerCase();
-  const mailProv = mail === "yyds" ? "yyds" : mail === "gptmail" ? "gptmail" : mail === "cfmail" ? "cfmail" : "moemail";
+  const mailProv = mail === "yyds" ? "yyds" : mail === "gptmail" ? "gptmail" : mail === "cfmail" ? "cfmail" : (mail === "vwhmail" || mail === "vwh") ? "vwhmail" : "moemail";
   if ($("reg-mail-provider")) {
     $("reg-mail-provider").value = mailProv;
   }
@@ -2838,6 +2855,10 @@ function applyRegConfig(cfg) {
       cfg.cfmail_api_key != null && cfg.cfmail_api_key !== ""
         ? String(cfg.cfmail_api_key)
         : (mailProv === "cfmail" ? activeKey : (regMailKeys.cfmail || "")),
+    vwhmail:
+      mailProv === "vwhmail"
+        ? (activeKey || (cfg.moemail_api_key != null ? String(cfg.moemail_api_key) : "") || "vwhmail-open")
+        : (regMailKeys.vwhmail || ""),
   };
   // Domain: if the dedicated field is present (including empty string from server),
   // honor it. Empty means cleared — do not restore from cache/localStorage.
@@ -2855,6 +2876,7 @@ function applyRegConfig(cfg) {
     yyds: pickDomain("yyds_domain", mailProv === "yyds"),
     gptmail: pickDomain("gptmail_domain", mailProv === "gptmail"),
     cfmail: pickDomain("cfmail_domain", mailProv === "cfmail"),
+    vwhmail: pickDomain("moemail_domain", mailProv === "vwhmail") || pickDomain("domain", mailProv === "vwhmail"),
   };
   // If server returned empty dedicated slot for active provider, force empty.
   if (mailProv === "yyds" && Object.prototype.hasOwnProperty.call(cfg, "yyds_domain")) {
@@ -2868,6 +2890,9 @@ function applyRegConfig(cfg) {
   }
   if (mailProv === "moemail" && Object.prototype.hasOwnProperty.call(cfg, "moemail_domain")) {
     regMailDomains.moemail = cfg.moemail_domain == null ? "" : String(cfg.moemail_domain);
+  }
+  if (mailProv === "vwhmail") {
+    regMailDomains.vwhmail = String(cfg.domain || cfg.moemail_domain || regMailDomains.vwhmail || "");
   }
   regMailProviderPrev = mailProv;
   // Hydrate per-provider hosts independently.
@@ -2883,6 +2908,7 @@ function applyRegConfig(cfg) {
   regMailBaseUrls = {
     moemail: pickBase("moemail_base_url", mailProv === "moemail"),
     cfmail: pickBase("cfmail_base_url", mailProv === "cfmail"),
+    vwhmail: pickBase("moemail_base_url", mailProv === "vwhmail") || pickBase("base_url", mailProv === "vwhmail"),
   };
   if (mailProv === "moemail" && Object.prototype.hasOwnProperty.call(cfg, "moemail_base_url")) {
     regMailBaseUrls.moemail = cfg.moemail_base_url == null ? "" : String(cfg.moemail_base_url);
@@ -2890,8 +2916,11 @@ function applyRegConfig(cfg) {
   if (mailProv === "cfmail" && Object.prototype.hasOwnProperty.call(cfg, "cfmail_base_url")) {
     regMailBaseUrls.cfmail = cfg.cfmail_base_url == null ? "" : String(cfg.cfmail_base_url);
   }
+  if (mailProv === "vwhmail") {
+    regMailBaseUrls.vwhmail = String(cfg.base_url || cfg.moemail_base_url || regMailBaseUrls.vwhmail || "");
+  }
   if ($("reg-base-url")) {
-    $("reg-base-url").value = (mailProv === "moemail" || mailProv === "cfmail")
+    $("reg-base-url").value = (mailProv === "moemail" || mailProv === "cfmail" || mailProv === "vwhmail")
       ? (regMailBaseUrls[mailProv] || "")
       : "";
   }
@@ -3055,7 +3084,9 @@ function buildRegBody(config) {
         ? "gptmail"
         : mailProvider === "cfmail"
           ? "cfmail"
-          : "moemail";
+          : (mailProvider === "vwhmail" || mailProvider === "vwh")
+            ? "vwhmail"
+            : "moemail";
   // Keep legacy field for older backends.
   body.provider = body.mail_provider;
   // MoeMail + CF Temp Email need base_url; YYDS/GPTMail use fixed hosts.
@@ -3068,6 +3099,10 @@ function buildRegBody(config) {
   } else if (body.mail_provider === "cfmail") {
     body.base_url = body.cfmail_base_url || (config.base_url == null ? "" : String(config.base_url));
     body.cfmail_base_url = body.base_url;
+  } else if (body.mail_provider === "vwhmail") {
+    // vwhmail reuses moemail_base_url / domain slots on the backend.
+    body.base_url = body.moemail_base_url || (config.base_url == null ? "" : String(config.base_url));
+    body.moemail_base_url = body.base_url;
   }
   // Always send domain for the active provider (empty clears/auto).
   body.domain = config.domain == null ? "" : String(config.domain);
