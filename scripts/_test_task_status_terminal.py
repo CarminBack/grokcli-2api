@@ -29,8 +29,8 @@ def _parse_sse(frames: list[str]) -> list[dict]:
 
 
 def main() -> int:
-    import anthropic_compat as a
-    import openai_responses as o
+    from grok2api.protocol import anthropic_compat as a
+    from grok2api.protocol import openai_responses as o
 
     print("=== tool readiness ===")
     cases = [
@@ -293,6 +293,10 @@ def main() -> int:
         assert any("[DONE]" in f for f in fail3)
     print("  incomplete Update empty-path OK")
 
+    print("\n=== Update file_path beats path alias ===")
+    test_update_file_path_beats_path_alias()
+    print("  file_path beats path OK")
+
     print("\n=== Update→Edit remapping (Claude Code) ===")
     test_update_to_edit_remap_all_paths()
     print("  Update→Edit remapping OK")
@@ -311,6 +315,171 @@ def main() -> int:
 
 
 
+
+def test_update_file_path_beats_path_alias():
+    """Claude Code → sub2api → grokcli-2api: Update/Edit must not open the wrong file.
+
+    Stream merges and doubled JSON often carry both path (OpenAI/Cursor style)
+    and file_path (Claude Code schema). Later complete rewrites must win over
+    stale early path previews (including when the early key was already
+    canonical file_path and the later key is only path).
+    """
+    import json
+    from grok2api.protocol import anthropic_compat as anth
+
+    # 1) Single object: alias first, then canonical (same value) → keep file_path
+    n_same = anth.normalize_tool_argument_keys(
+        {"path": "/same", "file_path": "/same", "old_string": "a", "new_string": "b"}
+    )
+    assert n_same["file_path"] == "/same", n_same
+    assert "path" not in n_same, n_same
+
+    # 1b) Different values in one object: later key wins (insertion order)
+    n = anth.normalize_tool_argument_keys(
+        {"path": "/wrong", "file_path": "/correct", "old_string": "a", "new_string": "b"}
+    )
+    assert n["file_path"] == "/correct", n
+    assert "path" not in n, n
+
+    n2 = anth.normalize_tool_argument_keys(
+        {"file_path": "/wrong", "path": "/correct", "old_string": "a", "new_string": "b"}
+    )
+    assert n2["file_path"] == "/correct", n2
+
+    # 3) Stream merge: incomplete path-only first, later complete rewrite wins
+    #    (including path under alias). Early path-only previews are often wrong
+    #    and must not stick over a later complete Update/Edit payload.
+    merged = anth.merge_tool_argument_delta(
+        '{"file_path":"/stale-preview"}',
+        '{"path":"/correct","old_string":"a","new_string":"b"}',
+        tool_name="Update",
+    )
+    obj = json.loads(merged)
+    assert obj.get("file_path") == "/correct", merged
+    assert obj.get("old_string") == "a", merged
+    assert obj.get("new_string") == "b", merged
+    assert "path" not in obj, merged
+
+    # 3b) Complete early payload must not be clobbered by later incomplete path
+    merged_keep = anth.merge_tool_argument_delta(
+        '{"file_path":"/correct","old_string":"a","new_string":"b"}',
+        '{"path":"/wrong"}',
+        tool_name="Update",
+    )
+    obj_keep = json.loads(merged_keep)
+    assert obj_keep.get("file_path") == "/correct", merged_keep
+    assert obj_keep.get("old_string") == "a", merged_keep
+    assert obj_keep.get("new_string") == "b", merged_keep
+
+    # 3c) BOTH complete: later path rewrite must replace early wrong file_path
+    #     (the intermittent "Error editing file" path after sub2api).
+    merged_both = anth.merge_tool_argument_delta(
+        '{"file_path":"/wrong","old_string":"a","new_string":"b"}',
+        '{"path":"/correct","old_string":"a","new_string":"c"}',
+        tool_name="Update",
+    )
+    obj_both = json.loads(merged_both)
+    assert obj_both.get("file_path") == "/correct", merged_both
+    assert obj_both.get("new_string") == "c", merged_both
+
+    # 4) Stream merge opposite order: path first, then correct file_path rewrite
+    merged2 = anth.merge_tool_argument_delta(
+        '{"path":"/wrong"}',
+        '{"file_path":"/correct","old_string":"a","new_string":"b"}',
+        tool_name="Update",
+    )
+    obj2 = json.loads(merged2)
+    assert obj2.get("file_path") == "/correct", merged2
+
+    # 5) Doubled blob in one chunk
+    san = anth.sanitize_tool_arguments_json(
+        '{"path":"/wrong"}{"file_path":"/correct","old_string":"a","new_string":"b"}',
+        tool_name="Update",
+    )
+    san_obj = json.loads(anth.normalize_tool_arguments_json(san, tool_name="Update"))
+    assert san_obj.get("file_path") == "/correct", san_obj
+
+    # 5b) Intermittent failure: early wrong file_path + later complete rewrite via path
+    san_flip = anth.sanitize_tool_arguments_json(
+        '{"file_path":"/wrong"}{"path":"/correct","old_string":"a","new_string":"b"}',
+        tool_name="Update",
+    )
+    san_flip_obj = json.loads(
+        anth.normalize_tool_arguments_json(san_flip, tool_name="Update")
+    )
+    assert san_flip_obj.get("file_path") == "/correct", san_flip_obj
+    assert san_flip_obj.get("old_string") == "a", san_flip_obj
+
+    # 5c) Doubled BOTH complete: later path body must win
+    san_both = anth.sanitize_tool_arguments_json(
+        '{"file_path":"/wrong","old_string":"a","new_string":"b"}'
+        '{"path":"/correct","old_string":"a","new_string":"c"}',
+        tool_name="Update",
+    )
+    san_both_obj = json.loads(
+        anth.normalize_tool_arguments_json(san_both, tool_name="Update")
+    )
+    assert san_both_obj.get("file_path") == "/correct", san_both_obj
+    assert san_both_obj.get("new_string") == "c", san_both_obj
+
+    # 5d) Stream merge: partial wrong path then complete rewrite under alias.
+    m_flip = anth.merge_tool_argument_delta(
+        '{"file_path":"/wrong"}',
+        '{"path":"/correct","old_string":"old","new_string":"new"}',
+        tool_name="Update",
+    )
+    m_flip_obj = json.loads(m_flip)
+    assert m_flip_obj.get("file_path") == "/correct", m_flip_obj
+    assert m_flip_obj.get("old_string") == "old", m_flip_obj
+
+    # 5e) target_file alias (Cursor / Codex style)
+    n_tf = anth.normalize_tool_argument_keys(
+        {"target_file": "/via-target", "old_string": "a", "new_string": "b"}
+    )
+    assert n_tf.get("file_path") == "/via-target", n_tf
+    assert "target_file" not in n_tf, n_tf
+
+    # 6) Empty canonical should not block a non-empty alias
+    n3 = anth.normalize_tool_argument_keys({"file_path": "", "path": "/only-alias"})
+    assert n3.get("file_path") == "/only-alias", n3
+
+    # 7) openai_responses local mirror agrees
+    from grok2api.protocol import openai_responses as oresp
+    ln = oresp._local_normalize_tool_arg_keys(
+        {"path": "/wrong", "file_path": "/correct"}
+    )
+    assert ln.get("file_path") == "/correct", ln
+
+    ln2 = oresp._local_normalize_tool_arg_keys(
+        {"file_path": "/wrong", "path": "/correct"}
+    )
+    assert ln2.get("file_path") == "/correct", ln2
+
+    # 7b) local doubled blob flip (wrong early file_path, later complete path)
+    san_local = oresp._local_sanitize_tool_arguments_json(
+        '{"file_path":"/wrong"}{"path":"/correct","old_string":"a","new_string":"b"}',
+        tool_name="Update",
+    )
+    san_local_obj = json.loads(
+        oresp._local_normalize_tool_arguments_json(san_local, tool_name="Update")
+    )
+    assert san_local_obj.get("file_path") == "/correct", san_local_obj
+
+    # 7c) local doubled both-complete
+    san_local_both = oresp._local_sanitize_tool_arguments_json(
+        '{"file_path":"/wrong","old_string":"a","new_string":"b"}'
+        '{"path":"/correct","old_string":"a","new_string":"c"}',
+        tool_name="Update",
+    )
+    san_local_both_obj = json.loads(
+        oresp._local_normalize_tool_arguments_json(san_local_both, tool_name="Update")
+    )
+    assert san_local_both_obj.get("file_path") == "/correct", san_local_both_obj
+    assert san_local_both_obj.get("new_string") == "c", san_local_both_obj
+
+    print("test_update_file_path_beats_path_alias OK")
+
+
 def test_update_to_edit_remap_all_paths():
     """Claude Code only registers Edit; Grok often invents Update/StrReplace.
 
@@ -318,8 +487,8 @@ def test_update_to_edit_remap_all_paths():
     must rewrite Update→Edit. Empty allow-list still remaps (sub2api often
     fails to forward the tools array).
     """
-    import anthropic_compat as anth
-    import openai_responses as oresp
+    from grok2api.protocol import anthropic_compat as anth
+    from grok2api.protocol import openai_responses as oresp
 
     # 1) pure remapper
     assert anth.canonical_outbound_tool_name("Update", allowed_names=None) == "Edit"
@@ -493,9 +662,9 @@ def test_soft_disconnect_does_not_drop_body_frames():
     Code hard-cut ("stream interrupted").
     """
     import asyncio
-    import app as application
-    import openai_responses as oresp
-    import anthropic_compat as anth
+    import grok2api.app as application
+    from grok2api.protocol import openai_responses as oresp
+    from grok2api.protocol import anthropic_compat as anth
 
     full_args = (
         '{"file_path":"/tmp/x.py","old_string":"old","new_string":"new"}'
@@ -637,3 +806,4 @@ if __name__ == "__main__":
     except Exception as e:
         print("ERROR:", type(e).__name__, e, file=sys.stderr)
         raise
+

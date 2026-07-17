@@ -41,7 +41,7 @@ jobs:
         id: ver
         run: |
           set -euo pipefail
-          V=$(python3 -c 'import re,pathlib; t=pathlib.Path("app.py").read_text(encoding="utf-8"); m=re.search(r"APP_VERSION\s*=\s*\"([^\"]+)\"", t); assert m, "APP_VERSION not found"; print(m.group(1))')
+          V=$(python3 -c 'import re,pathlib; t=pathlib.Path("grok2api/app.py").read_text(encoding="utf-8"); m=re.search(r"APP_VERSION\s*=\s*\"([^\"]+)\"", t); assert m, "APP_VERSION not found"; print(m.group(1))')
           echo "app_version=$V" >> "$GITHUB_OUTPUT"
           echo "APP_VERSION=$V"
 
@@ -53,7 +53,7 @@ jobs:
           APP="${{ steps.ver.outputs.app_version }}"
           echo "tag=$TAG app=$APP"
           if [[ "$TAG" != "$APP" ]]; then
-            echo "ERROR: git tag v$TAG must equal APP_VERSION $APP in app.py" >&2
+            echo "ERROR: git tag v$TAG must equal APP_VERSION $APP in grok2api/app.py" >&2
             exit 1
           fi
 

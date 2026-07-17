@@ -13,6 +13,12 @@ window.G2A = window.G2A || {};
   const currentOrigin = () => (window.G2A && G2A.currentOrigin ? G2A.currentOrigin() : (location.origin || ""));
   const currentAdminUrl = () => (window.G2A && G2A.currentAdminUrl ? G2A.currentAdminUrl() : ((location.origin || "") + "/admin"));
   const TOKEN_KEY = (window.G2A && G2A.TOKEN_KEY) || "g2a_admin_token";
+  const adminBasePath = () => {
+    const path = String(location.pathname || "");
+    const i = path.indexOf("/admin");
+    return (i >= 0 ? path.slice(0, i) : "") + "/admin";
+  };
+  const API_BASE = (window.G2A && G2A.API_BASE) || (adminBasePath() + "/api");
   let token = (window.G2A && G2A.getToken) ? G2A.getToken() : (localStorage.getItem(TOKEN_KEY) || "");
   let statusCache = null;
   let dashCache = null;
@@ -25,6 +31,7 @@ window.G2A = window.G2A || {};
   let regFinishedNotified = false;
   let regStopping = false;
   let regPollInFlight = false;
+  let regPollPending = false;
   let regLastLogText = "";
   let regLastStatusText = "";
   let regLastEmailText = "";
@@ -44,6 +51,8 @@ window.G2A = window.G2A || {};
   let accountsPageSize = 25;
   let accountsSearchQuery = "";
   let accountsSort = "newest";
+  // "" | "1" | "0" — server-side has_sso filter
+  let accountsSsoFilter = "";
   let selectedAccountIds = new Set();
   function syncToken() { token = (window.G2A && G2A.getToken) ? G2A.getToken() : token; }
   function headers(json = true) {
@@ -59,13 +68,25 @@ window.G2A = window.G2A || {};
       try { return await G2A.api(path, opts); }
       catch (e) { if (e && e.status === 401) token = ""; throw e; }
     }
-    const res = await fetch("/admin/api" + path, {
+    const res = await fetch(API_BASE + path, {
       ...opts,
       credentials: "same-origin",
       headers: { ...headers(!(opts.body instanceof FormData) && opts.method !== "GET"), ...(opts.headers || {}) },
     });
     let data = null;
-    try { data = await res.json(); } catch { data = null; }
+    try {
+      const ct = (res.headers.get("content-type") || "").toLowerCase();
+      if (ct.includes("application/json")) data = await res.json();
+      else {
+        const text = await res.text();
+        if (/^\s*<!doctype\s+html|^\s*<html[\s>]/i.test(text || "")) {
+          const err = new Error("Admin API 返回了 HTML 页面，请检查 " + API_BASE + path + " 的反向代理/部署路径。响应片段：" + String(text || "").replace(/\s+/g, " ").trim().slice(0, 180));
+          err.status = res.status;
+          throw err;
+        }
+        data = text ? { detail: text.slice(0, 300) } : null;
+      }
+    } catch (e) { if (e && e.status != null) throw e; data = null; }
     if (!res.ok) {
       const msg = (data && (data.detail || data.error || data.message)) || res.statusText;
       const err = new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
@@ -419,13 +440,18 @@ function rebindPageControls() {
   try { bindLogsControls(); } catch (_) {}
   try { bindUsageControls(); } catch (_) {}
   try { hideEmptyLogPanels(); } catch (_) {}
+  // Soft-nav replaces .g2a-content; sub2api buttons must be rebound every time.
+  try { bindSub2apiUi(); } catch (_) {}
   // Soft-nav swaps DOM; re-show active registration card + keep polling if needed.
   // Full page refresh loses in-memory ids — restore from backend when missing.
   try {
     const page = document.body.dataset.page || pageFromPath(location.pathname) || "";
     if (page === "accounts") {
+      // Soft-nav keeps JS heap, but hard-refresh recovery may land here first.
+      if (!hasTrackedRegTask()) applyRegTrack(loadRegTrack());
       if (hasTrackedRegTask()) {
         showPanel("reg-session-box");
+        // Never re-poll a finished card (avoids completion-toast spam).
         if (!regFinishedNotified) startRegPolling({ immediate: true });
       } else {
         restoreActiveRegistration({ force: true, toastIfEmpty: false }).catch(() => {});
@@ -625,6 +651,25 @@ function rebindPageControls() {
       loadAccountsPage({ reset: true });
     };
   }
+  if ($("acc-filter-sso")) {
+    try {
+      const savedSso = localStorage.getItem("g2a_accounts_sso_filter");
+      if (savedSso === "1" || savedSso === "0" || savedSso === "") {
+        accountsSsoFilter = savedSso || "";
+        $("acc-filter-sso").value = accountsSsoFilter;
+      } else {
+        accountsSsoFilter = $("acc-filter-sso").value || "";
+      }
+    } catch (_) {
+      accountsSsoFilter = $("acc-filter-sso").value || "";
+    }
+    $("acc-filter-sso").onchange = () => {
+      accountsSsoFilter = ($("acc-filter-sso").value || "");
+      try { localStorage.setItem("g2a_accounts_sso_filter", accountsSsoFilter); } catch (_) {}
+      accountsPage = 1;
+      loadAccountsPage({ reset: true });
+    };
+  }
   if ($("btn-acc-select-page")) $("btn-acc-select-page").onclick = () => setPageSelection(true);
   if ($("btn-acc-select-all-filtered")) $("btn-acc-select-all-filtered").onclick = () => { setPageSelection(true); toast("已选择本页账号（服务端分页）"); };
   if ($("btn-acc-select-none")) $("btn-acc-select-none").onclick = () => { selectedAccountIds.clear(); renderAccountsPage(); };
@@ -632,6 +677,8 @@ function rebindPageControls() {
   if ($("btn-acc-renew-selected")) $("btn-acc-renew-selected").onclick = () => renewAccounts(Array.from(selectedAccountIds));
   if ($("btn-acc-probe-selected")) $("btn-acc-probe-selected").onclick = () => probeAccounts(Array.from(selectedAccountIds));
   if ($("btn-acc-export-selected")) $("btn-acc-export-selected").onclick = () => exportSelectedAccounts();
+  if ($("btn-acc-export-sso-selected")) $("btn-acc-export-sso-selected").onclick = () => exportSelectedAccountsSso();
+  if ($("btn-acc-export-sso-all")) $("btn-acc-export-sso-all").onclick = () => exportAllAccountsSso();
   on("acc-page-prev", "onclick", () => { if (accountsPage > 1 && !accountsLoading) { accountsPage--; loadAccountsPage(); } });
   on("acc-page-next", "onclick", () => { if (!accountsLoading && accountsPage < (accountsTotalPages || 1)) { accountsPage++; loadAccountsPage(); } });
   on("acc-page-size", "onchange", () => {
@@ -696,7 +743,7 @@ on("btn-export-sso", "onclick", () => exportRegistrationSso());
       toast(r.message || `已启动注册 ×${startedCount}（线程 ${workers}，同时最多 ${workers} 个）`);
       // Start path auto-saves on server; refresh form from DB shortly after
       setTimeout(() => { loadRegConfig(true).catch(() => {}); }, 300);
-      startRegPolling({ immediate: true, intervalMs: 2000 });
+      startRegPolling({ immediate: true, intervalMs: 1000 });
     } catch (e) { toast(e.message, false); }
     finally { if ($("btn-start-reg")) $("btn-start-reg").disabled = false; }
   });
@@ -1119,8 +1166,8 @@ function renderStats() {
     <div class="stat"><div class="label">API Base</div><div class="value mono">${esc(d.api_base || s.api_base || "")}</div></div>
     <div class="stat"><div class="label">CLI 版本</div><div class="value mono">${esc(d.cli_version || s.cli_version || "")}</div>
       <div class="sub">上游 ${esc(d.upstream || s.upstream || "")}</div></div>
-    <div class="stat"><div class="label">账号池</div><div class="value">${pool.total ?? acc.account_count ?? 0} 总数 · ${pool.enabled ?? acc.active_count ?? 0} 启用 / ${pool.live ?? acc.active_count ?? 0} 有效</div>
-      <div class="sub">模式 ${esc(d.account_mode || s.account_mode || "—")} · 冷却 ${pool.in_cooldown ?? 0} · 额度禁用 ${pool.quota_disabled ?? 0}</div></div>
+    <div class="stat"><div class="label">账号池</div><div class="value">${pool.total ?? acc.account_count ?? 0} 总量 · ${pool.live ?? pool.enabled ?? acc.active_count ?? 0} 可轮询</div>
+      <div class="sub">模式 ${esc(d.account_mode || s.account_mode || "—")} · 冷却 ${pool.in_cooldown ?? 0} · 过期 ${pool.expired ?? 0} · 模型封禁 ${pool.model_blocked ?? 0} · 额度禁用 ${pool.quota_disabled ?? 0} · 禁用 ${pool.disabled ?? 0}</div></div>
     <div class="stat"><div class="label">API Keys</div><div class="value">${keys.enabled ?? 0} 启用 / ${keys.total ?? 0}</div>
       <div class="sub">请求累计 ${keys.total_requests ?? 0} · 鉴权 ${keys.auth_required ? "开启" : "关闭"}</div></div>
     <div class="stat"><div class="label">今日用量</div><div class="value mono">${fmtNum((d.usage || s.usage || {}).today_tokens || 0)} token</div>
@@ -1290,6 +1337,13 @@ function renderAccountsPage() {
       const cdCount = Number(p.cooldown_count || stackLen || 0) || 0;
       const cooling = !!(p.in_cooldown || cdCount > 0 || stackLen > 0 || p.pool_status === "cooldown");
       const quotaOff = p.disabled_for_quota;
+      const expired = !!(
+        p.pool_status === "expired"
+        || a.expired
+        || p.token_expired_at
+        || ["failed","expired","sso_failed","no_sso_removed","no_sso_deleted","sso_attempt"].includes(String(p.last_renew_status || ""))
+      );
+      const renewFails = Number(p.renew_fail_count || 0) || 0;
       const streak = Number(p.consecutive_fails || 0) || 0;
       const cdCode = p.cooldown_code || "";
       const cdModel = p.cooldown_model || "";
@@ -1297,6 +1351,16 @@ function renderAccountsPage() {
         ? `${p.cooldown_tokens_actual}/${p.cooldown_tokens_limit}` : "";
       let poolLabel;
       if (quotaOff) poolLabel = '<span class="g2a-tag bad">额度禁用</span>';
+      else if (expired) {
+        const tip = [
+          "已过期，已移出轮询",
+          renewFails ? `续期失败×${renewFails}` : "",
+          p.last_renew_error || p.token_expired_reason || p.last_error || "",
+          p.last_renew_status === "no_sso_removed" || p.last_renew_status === "no_sso_deleted" ? "无 SSO，续不上 AT 已删除" : "",
+          p.last_renew_status === "sso_failed" ? "SSO 重登失败" : "",
+        ].filter(Boolean).join(" · ");
+        poolLabel = `<span class="g2a-tag bad" title="${esc(tip)}">过期</span>`;
+      }
       else if (!enabled) poolLabel = '<span class="g2a-tag bad">已禁用</span>';
       else if (cooling) {
         const n = cdCount > 0 ? cdCount : 1;
@@ -1316,6 +1380,9 @@ function renderAccountsPage() {
       const refreshPill = a.has_refresh_token
         ? '<span class="g2a-tag ok" title="可自动 refresh">可自动续期</span>'
         : '<span class="g2a-tag warn">无 refresh</span>';
+      const ssoPill = a.has_sso
+        ? '<span class="g2a-tag ok" title="账号库已保存 SSO cookie">有SSO</span>'
+        : '<span class="g2a-tag" title="未保存 SSO cookie">无SSO</span>';
       const liveQ = quotaCache[a.id];
       const probeCell = fmtProbeCell(p.last_probe, p.last_error, p.blocked_model_ids);
       const checked = selectedAccountIds.has(a.id) ? "checked" : "";
@@ -1331,7 +1398,7 @@ function renderAccountsPage() {
       <td style="font-size:0.78rem;min-width:160px">${probeCell}</td>
       <td style="font-size:0.8rem;min-width:150px">
         ${expiryCell}
-        <div style="margin-top:6px">${refreshPill}</div>
+        <div style="margin-top:6px">${refreshPill} ${ssoPill}</div>
       </td>
       <td class="g2a-actions">
         <button class="g2a-btn g2a-btn-default g2a-btn-sm" data-act="renew-one" data-id="${esc(a.id)}" ${a.has_refresh_token ? "" : "disabled title=\"无 refresh_token，无法续期\""}>续期</button>
@@ -1389,13 +1456,17 @@ async function loadAccountsPage({ reset = false } = {}) {
   const q = (accountsSearchQuery || ($("acc-search") && $("acc-search").value) || "").trim();
   accountsSearchQuery = q;
   if ($("acc-sort") && $("acc-sort").value) accountsSort = $("acc-sort").value;
+  if ($("acc-filter-sso")) accountsSsoFilter = $("acc-filter-sso").value || "";
   const sort = accountsSort || "newest";
   const pageSize = accountsPageSize || 25;
   const page = accountsPage || 1;
+  const ssoQs = (accountsSsoFilter === "1" || accountsSsoFilter === "0")
+    ? `&has_sso=${encodeURIComponent(accountsSsoFilter === "1" ? "true" : "false")}`
+    : "";
   try {
     const data = await api(
       `/accounts?page=${encodeURIComponent(page)}&page_size=${encodeURIComponent(pageSize)}` +
-      `&q=${encodeURIComponent(q)}&sort=${encodeURIComponent(sort)}`
+      `&q=${encodeURIComponent(q)}&sort=${encodeURIComponent(sort)}${ssoQs}`
     );
     if (seq !== accountsLoadSeq) return;
     const rawAccounts = Array.isArray(data && data.accounts) ? data.accounts : [];
@@ -1535,8 +1606,24 @@ function renderOneAccountRow(account) {
   const cdCount = Number(p.cooldown_count || stackLen || 0) || 0;
   const cooling = !!(p.in_cooldown || cdCount > 0 || stackLen > 0 || p.pool_status === "cooldown");
   const quotaOff = p.disabled_for_quota;
+  const expired = !!(
+    p.pool_status === "expired"
+    || a.expired
+    || p.token_expired_at
+    || ["failed","expired","sso_failed","no_sso_removed","no_sso_deleted","sso_attempt"].includes(String(p.last_renew_status || ""))
+  );
+  const renewFails = Number(p.renew_fail_count || 0) || 0;
   let poolLabel;
   if (quotaOff) poolLabel = '<span class="g2a-tag bad">额度禁用</span>';
+  else if (expired) {
+    const tip = [
+      "已过期，已移出轮询",
+      renewFails ? `续期失败×${renewFails}` : "",
+      p.last_renew_error || p.token_expired_reason || p.last_error || "",
+      p.last_renew_status === "no_sso_removed" || p.last_renew_status === "no_sso_deleted" ? "无 SSO，续不上 AT 已删除" : "",
+    ].filter(Boolean).join(" · ");
+    poolLabel = `<span class="g2a-tag bad" title="${esc(tip)}">过期</span>`;
+  }
   else if (!enabled) poolLabel = '<span class="g2a-tag bad">已禁用</span>';
   else if (cooling) {
     const n = cdCount > 0 ? cdCount : 1;
@@ -1548,6 +1635,9 @@ function renderOneAccountRow(account) {
   const refreshPill = a.has_refresh_token
     ? '<span class="g2a-tag ok" title="可自动 refresh">可自动续期</span>'
     : '<span class="g2a-tag warn">无 refresh</span>';
+  const ssoPill = a.has_sso
+    ? '<span class="g2a-tag ok" title="账号库已保存 SSO cookie">SSO</span>'
+    : '<span class="g2a-tag" title="未保存 SSO cookie">无SSO</span>';
   const liveQ = quotaCache[a.id];
   const probeCell = fmtProbeCell(p.last_probe, p.last_error, p.blocked_model_ids);
   const checked = selectedAccountIds.has(a.id) ? "checked" : "";
@@ -1563,7 +1653,7 @@ function renderOneAccountRow(account) {
       <td style="font-size:0.78rem;min-width:160px">${probeCell}</td>
       <td style="font-size:0.8rem;min-width:150px">
         ${expiryCell}
-        <div style="margin-top:6px">${refreshPill}</div>
+        <div style="margin-top:6px">${refreshPill} ${ssoPill}</div>
       </td>
       <td class="g2a-actions">
         <button class="g2a-btn g2a-btn-default g2a-btn-sm" data-act="renew-one" data-id="${esc(a.id)}" ${a.has_refresh_token ? "" : "disabled title=\"无 refresh_token，无法续期\""}>续期</button>
@@ -1778,6 +1868,98 @@ async function exportSelectedAccounts() {
   });
 }
 
+function _downloadTextFile(filename, content, mime) {
+  try {
+    const blob = new Blob([content || ""], { type: mime || "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename || "export.txt";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1500);
+    return true;
+  } catch (e) {
+    console.error(e);
+    return false;
+  }
+}
+
+async function exportSelectedAccountsSso() {
+  const ids = Array.from(selectedAccountIds);
+  if (!ids.length) {
+    toast("请先勾选要导出 SSO 的账号", false);
+    return;
+  }
+  const btn = $("btn-acc-export-sso-selected");
+  const includePassword = !!( $("export-include-password") && $("export-include-password").checked );
+  if (btn) {
+    btn.disabled = true;
+    if (!btn.dataset.label) btn.dataset.label = btn.textContent;
+    btn.textContent = "导出中…";
+  }
+  try {
+    const data = await api("/accounts/export-sso?download=0", {
+      method: "POST",
+      body: JSON.stringify({
+        ids,
+        only_with_sso: true,
+        format: "txt",
+        include_password: includePassword,
+      }),
+    });
+    if (!data || !data.content) {
+      toast("选中账号没有可导出的 SSO", false);
+      return;
+    }
+    const filename = data.filename || "grok2api-accounts-sso-selected.txt";
+    if (!_downloadTextFile(filename, data.content, "text/plain;charset=utf-8")) {
+      toast("下载失败", false);
+      return;
+    }
+    toast(`已导出 ${data.with_sso || data.count || 0} 条 SSO`, true);
+  } catch (e) {
+    toast("导出 SSO 失败: " + (e.message || e), false);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = btn.dataset.label || "导出选中 SSO";
+    }
+  }
+}
+
+async function exportAllAccountsSso() {
+  const btn = $("btn-acc-export-sso-all");
+  const includePassword = !!( $("export-include-password") && $("export-include-password").checked );
+  if (btn) {
+    btn.disabled = true;
+    if (!btn.dataset.label) btn.dataset.label = btn.textContent;
+    btn.textContent = "导出中…";
+  }
+  try {
+    const qs = `download=0&format=txt&include_password=${includePassword ? 1 : 0}`;
+    const data = await api(`/accounts/export-sso?${qs}`);
+    if (!data || !data.content) {
+      toast("没有带 SSO 的账号可导出", false);
+      return;
+    }
+    const filename = data.filename || "grok2api-accounts-sso.txt";
+    if (!_downloadTextFile(filename, data.content, "text/plain;charset=utf-8")) {
+      toast("下载失败", false);
+      return;
+    }
+    toast(`已导出 ${data.with_sso || data.count || 0} 条 SSO`, true);
+  } catch (e) {
+    toast("导出全部 SSO 失败: " + (e.message || e), false);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = btn.dataset.label || "导出全部 SSO";
+    }
+  }
+}
+
 // Fallback bindings when page scripts load outside bindSoftNav rebind path.
 on("acc-page-prev", "onclick", () => { if (accountsPage > 1 && !accountsLoading) { accountsPage--; loadAccountsPage(); } });
 on("acc-page-next", "onclick", () => { if (!accountsLoading && accountsPage < (accountsTotalPages || 1)) { accountsPage++; loadAccountsPage(); } });
@@ -1797,6 +1979,28 @@ if ($("acc-sort") && !$("acc-sort").onchange) {
     accountsPage = 1;
     loadAccountsPage({ reset: true });
   };
+}
+
+if ($("acc-filter-sso") && !$("acc-filter-sso").onchange) {
+  try {
+    const savedSso = localStorage.getItem("g2a_accounts_sso_filter");
+    if (savedSso === "1" || savedSso === "0" || savedSso === "") {
+      accountsSsoFilter = savedSso || "";
+      $("acc-filter-sso").value = accountsSsoFilter;
+    }
+  } catch (_) {}
+  $("acc-filter-sso").onchange = () => {
+    accountsSsoFilter = ($("acc-filter-sso").value || "");
+    try { localStorage.setItem("g2a_accounts_sso_filter", accountsSsoFilter); } catch (_) {}
+    accountsPage = 1;
+    loadAccountsPage({ reset: true });
+  };
+}
+if ($("btn-acc-export-sso-selected") && !$("btn-acc-export-sso-selected").onclick) {
+  $("btn-acc-export-sso-selected").onclick = () => exportSelectedAccountsSso();
+}
+if ($("btn-acc-export-sso-all") && !$("btn-acc-export-sso-all").onclick) {
+  $("btn-acc-export-sso-all").onclick = () => exportAllAccountsSso();
 }
 
 if ($("btn-acc-search")) $("btn-acc-search").onclick = () => applyAccountSearch(true);
@@ -2381,6 +2585,8 @@ function applyRegTrack(track) {
   regBatchId = batchId;
   regSessionIds = ids.length ? ids.slice() : (sid ? [sid] : []);
   regSessionId = regSessionIds[0] || sid || null;
+  // Always rehydrate finished flag from storage; never leave stale true/false from
+  // a previous soft-nav session.
   regFinishedNotified = !!track.finished;
   return hasTrackedRegTask();
 }
@@ -2409,7 +2615,10 @@ function dismissRegProgressCard() {
 
 function stopRegPolling() {
   try { clearInterval(regPollTimer); } catch (_) {}
+  try { clearTimeout(regPollTimer); } catch (_) {}
   regPollTimer = null;
+  regPollInFlight = false;
+  regPollPending = false;
 }
 
 function isNotFoundError(err) {
@@ -2442,14 +2651,19 @@ function markTrackedRegistrationMissing(reason) {
   clearRegTrack();
 }
 
-function startRegPolling({ immediate = true, intervalMs = 2000 } = {}) {
+function startRegPolling({ immediate = true, intervalMs = 1000 } = {}) {
   try { clearInterval(regPollTimer); } catch (_) {}
-  // While stopping, poll a bit slower to reduce UI thrash; never sub-second.
-  const ms = Math.max(regStopping ? 2000 : 1000, Number(intervalMs) || 2000);
+  try { clearTimeout(regPollTimer); } catch (_) {}
+  // Active registration needs ~1s freshness so waiting_email / captcha lines
+  // do not sit stale. Stopping uses a gentler cadence.
+  const ms = Math.max(regStopping ? 1500 : 800, Number(intervalMs) || 1000);
   regPollTimer = setInterval(() => {
     pollRegSession().catch(() => {});
   }, ms);
-  if (immediate) setTimeout(() => { pollRegSession().catch(() => {}); }, 300);
+  // Immediate first poll — do not wait a full interval (or the old 300ms delay).
+  if (immediate) {
+    setTimeout(() => { pollRegSession().catch(() => {}); }, 0);
+  }
 }
 
 async function stopRegistration() {
@@ -2560,7 +2774,7 @@ async function stopRegistration() {
     showPanel("reg-session-box");
     saveRegTrack();
     // Keep polling until cancelled/stopped, but avoid aggressive 1.2s thrash.
-    startRegPolling({ immediate: true, intervalMs: 2000 });
+    startRegPolling({ immediate: true, intervalMs: 1000 });
   } catch (e) {
     regStopping = false;
     toast((e && e.message) || "停止失败", false);
@@ -3251,28 +3465,17 @@ function adoptRegSessions(sessions, { batch = null, continuePolling = true } = {
   }
   if (!ids.length && !batchId) return false;
 
+  // Preserve "already finished" across restore so we never re-toast completion.
+  const wasFinished = !!regFinishedNotified;
+
   regBatchId = batchId || regBatchId || null;
   regSessionIds = ids.length ? ids.slice() : (regSessionId ? [regSessionId] : []);
   regSessionId = regSessionIds[0] || regSessionId || null;
-  regFinishedNotified = false;
   regStopping = false;
   regPollInFlight = false;
   regLastLogText = "";
   regLastStatusText = "";
   regLastEmailText = "";
-
-  if (list.length <= 1 && !regBatchId) {
-    showRegSession(list[0] || batchObj || { id: regSessionId, status: "running" }, {
-      batch: batchObj,
-    });
-  } else {
-    showRegSessionGroup(
-      list.length
-        ? list
-        : regSessionIds.map((id) => ({ id, status: "running", batch_id: regBatchId })),
-      { batch: batchObj }
-    );
-  }
 
   const batchStatus = String(
     (batchObj && (batchObj.batch_status || batchObj.status)) || ""
@@ -3285,20 +3488,70 @@ function adoptRegSessions(sessions, { batch = null, continuePolling = true } = {
       batchStatus === "error" ||
       batchStatus === "cancelled" ||
       batchStatus === "stopped" ||
+      batchStatus === "failed" ||
       (Number(batchObj.done || 0) > 0 &&
-        Number(batchObj.done || 0) >= Number(batchObj.total || batchObj.count || 0)));
+        Number(batchObj.done || 0) >= Number(batchObj.total || batchObj.count || 0) &&
+        !batchRunning) ||
+      (Number((batchObj.imported || 0) + (batchObj.error || 0) + (batchObj.cancelled || 0)) > 0 &&
+        Number((batchObj.imported || 0) + (batchObj.error || 0) + (batchObj.cancelled || 0)) >=
+          Number(batchObj.total || batchObj.count || 0) &&
+        !batchRunning));
   const allTerminal =
     list.length > 0 &&
     list.every((s) => isRegTerminalStatus(regStatusOf(s)));
-  const finished = !!batchDone || (allTerminal && !batchRunning);
+  const finished = !!wasFinished || !!batchDone || (allTerminal && !batchRunning);
 
-  if (continuePolling && !finished) {
-    startRegPolling({ immediate: true, intervalMs: 2000 });
-  } else if (finished) {
-    // One more poll paints the final summary / stops the timer cleanly.
-    pollRegSession().catch(() => {});
+  // Placeholder sessions for UI only when real session objects are missing.
+  // Never fake "running" for an already-finished batch — that freezes the card.
+  const placeholderStatus = finished
+    ? (batchStatus === "error" || batchStatus === "failed"
+        ? "error"
+        : batchStatus === "cancelled" || batchStatus === "stopped"
+          ? "cancelled"
+          : "done")
+    : "running";
+  const placeholderSessions = regSessionIds.map((id) => ({
+    id,
+    status: placeholderStatus,
+    batch_id: regBatchId,
+  }));
+
+  if (list.length <= 1 && !regBatchId) {
+    showRegSession(
+      list[0] ||
+        batchObj ||
+        { id: regSessionId, status: placeholderStatus, batch_id: regBatchId },
+      { batch: batchObj }
+    );
   } else {
-    startRegPolling({ immediate: true, intervalMs: 2000 });
+    showRegSessionGroup(list.length ? list : placeholderSessions, { batch: batchObj });
+  }
+
+  if (finished) {
+    // Already terminal: paint final card once, never re-toast via forced re-poll.
+    regFinishedNotified = true;
+    stopRegPolling();
+    // Ensure status text is not left as "restoring…"
+    try {
+      const total = Number((batchObj && (batchObj.total || batchObj.count)) || regSessionIds.length || 0);
+      const done = Number((batchObj && batchObj.done) || total || 0);
+      const ok = Number((batchObj && (batchObj.imported || batchObj.success)) || 0);
+      const fail = Number((batchObj && (batchObj.error || batchObj.failed)) || 0);
+      setRegStatusText(
+        total > 0
+          ? `已结束 · ${done}/${total}` + (ok || fail ? ` · 成功 ${ok} / 失败 ${fail}` : "")
+          : "已结束"
+      );
+      setRegEmailText(regBatchId ? `batch ${regBatchId}` : (regSessionId || "—"));
+    } catch (_) {}
+    saveRegTrack();
+    return true;
+  }
+
+  // Live task only.
+  regFinishedNotified = false;
+  if (continuePolling) {
+    startRegPolling({ immediate: true, intervalMs: 1000 });
   }
   saveRegTrack();
   return true;
@@ -3310,8 +3563,9 @@ async function restoreTrackedRegistration({ toastIfEmpty = false } = {}) {
   if (!track) return false;
   if (!applyRegTrack(track)) return false;
 
+  const alreadyFinished = !!(track.finished || regFinishedNotified);
   showPanel("reg-session-box");
-  setRegStatusText(track.finished ? "restoring…" : "restoring…");
+  setRegStatusText(alreadyFinished ? "已结束 · 恢复中…" : "restoring…");
   setRegEmailText(regBatchId ? `batch ${regBatchId}` : (regSessionId || "—"));
   setLogPanel(
     "reg-log",
@@ -3372,11 +3626,20 @@ async function restoreTrackedRegistration({ toastIfEmpty = false } = {}) {
       }
     }
     if (sessions.length || batch) {
+      // Preserve finished flag from sessionStorage so re-adopt does not re-toast.
+      const preserveFinished = alreadyFinished || regFinishedNotified;
       const ok = adoptRegSessions(sessions, {
         batch: batch || (regBatchId ? { id: regBatchId, batch_id: regBatchId, session_ids: regSessionIds } : null),
-        continuePolling: true,
+        continuePolling: !preserveFinished,
       });
-      if (ok) return true;
+      if (ok) {
+        if (preserveFinished) {
+          regFinishedNotified = true;
+          stopRegPolling();
+          saveRegTrack();
+        }
+        return true;
+      }
     }
     // Track exists but backend no longer has it (TTL expired / finished ages ago).
     markTrackedRegistrationMissing(batchMissing ? "batch not found" : "session not found");
@@ -3394,6 +3657,11 @@ async function restoreActiveRegistration({ force = false, toastIfEmpty = false }
     // Rehydrate from sessionStorage first (hard refresh path).
     applyRegTrack(loadRegTrack());
   }
+  // Already showing a finished card — don't re-adopt/re-toast on soft refresh.
+  if (!force && hasTrackedRegTask() && regFinishedNotified) {
+    showPanel("reg-session-box");
+    return true;
+  }
   // Always re-validate tracked ids against backend. Blindly resuming poll from a
   // stale sessionStorage track is what spammed console 404s after restarts.
   try {
@@ -3409,12 +3677,31 @@ async function restoreActiveRegistration({ force = false, toastIfEmpty = false }
 
     const activeBatches = batches
       .filter((b) => {
-        const st = String((b && (b.batch_status || b.status)) || "").toLowerCase();
-        const running = Number((b && b.running) || 0);
+        if (!b) return false;
+        const st = String((b.batch_status || b.status) || "").toLowerCase();
+        const running = Number(b.running || 0);
+        const total = Number(b.total || b.count || b.spawned || 0);
+        const done = Number(b.done || 0);
+        // Explicit live work.
         if (running > 0) return true;
-        if (!st || st === "running" || st === "starting" || st === "stopping" || st === "queued") {
+        // Terminal statuses are never "active".
+        if (
+          st === "done" ||
+          st === "partial" ||
+          st === "error" ||
+          st === "cancelled" ||
+          st === "stopped" ||
+          st === "failed"
+        ) {
+          return false;
+        }
+        // done >= total with no running → finished even if status lagging.
+        if (total > 0 && done >= total && running <= 0) return false;
+        // Only treat as active when status is clearly non-terminal / in-flight.
+        if (st === "running" || st === "starting" || st === "stopping" || st === "queued") {
           return true;
         }
+        // Unknown / empty status with no running workers is a ghost — ignore.
         return false;
       })
       .sort(
@@ -3480,9 +3767,24 @@ async function restoreActiveRegistration({ force = false, toastIfEmpty = false }
 }
 
 async function refreshRegistrationProgress({ toastIfEmpty = true } = {}) {
+  // Finished card: keep it visible, do not re-fire completion toast.
+  if (hasTrackedRegTask() && regFinishedNotified) {
+    showPanel("reg-session-box");
+    if (toastIfEmpty) toast("注册已结束（可点关闭收起进度卡片）", true);
+    return true;
+  }
   if (hasTrackedRegTask()) {
     showPanel("reg-session-box");
     await pollRegSession();
+    return true;
+  }
+  const track = loadRegTrack();
+  if (track && track.finished && applyRegTrack(track)) {
+    regFinishedNotified = true;
+    showPanel("reg-session-box");
+    setRegStatusText("已结束");
+    setRegEmailText(regBatchId ? `batch ${regBatchId}` : (regSessionId || "—"));
+    if (toastIfEmpty) toast("注册已结束（可点关闭收起进度卡片）", true);
     return true;
   }
   return restoreActiveRegistration({ force: true, toastIfEmpty });
@@ -3766,11 +4068,18 @@ async function probeImportedAccounts(accountIds, { sessions = [], delaySec = 30 
 }
 
 async function pollRegSession() {
-  // Prevent overlapping polls (stop + interval + soft-nav rebind) from thrashing DOM.
-  if (regPollInFlight) return;
+  // Trailing-edge: never silently drop a tick while a previous poll is still
+  // in flight — that freezes the progress log until the next free interval.
+  if (regPollInFlight) {
+    regPollPending = true;
+    return;
+  }
   regPollInFlight = true;
+  regPollPending = false;
   try {
   // Prefer batch endpoint when available for accurate total/success/fail.
+  // Batch embeds compact sessions (status/message/updated_at), so one request
+  // is enough for timely log updates in the common path.
   let batch = null;
   let batchMissing = false;
   if (regBatchId) {
@@ -3802,12 +4111,23 @@ async function pollRegSession() {
       sessions = batch.sessions.slice();
       sessionHits = sessions.length;
     } else {
-      for (const id of ids) {
-        try {
-          sessions.push(await api("/accounts/register-email/sessions/" + encodeURIComponent(id)));
+      // Parallel fetches: serial awaits on N sessions made each tick multi-second
+      // and caused the log panel to lag far behind real progress.
+      const results = await Promise.all(
+        ids.map(async (id) => {
+          try {
+            return { ok: true, data: await api("/accounts/register-email/sessions/" + encodeURIComponent(id)) };
+          } catch (e) {
+            return { ok: false, missing: isNotFoundError(e) };
+          }
+        })
+      );
+      for (const r of results) {
+        if (r && r.ok && r.data) {
+          sessions.push(r.data);
           sessionHits += 1;
-        } catch (e) {
-          if (isNotFoundError(e)) sessionMisses += 1;
+        } else if (r && r.missing) {
+          sessionMisses += 1;
         }
       }
     }
@@ -3815,8 +4135,15 @@ async function pollRegSession() {
     // Pull all sessions so late-spawned batch workers appear.
     // Strict filter: only the currently tracked batch / session ids — never
     // absorb leftover sessions from a previous finished/stopped registration.
+    // Skip this extra list call when the batch payload already has sessions —
+    // it was the main source of 2–4s poll lag under multi-worker load.
     let listHasTrackedBatch = false;
-    try {
+    const needListSweep =
+      !batch ||
+      !Array.isArray(batch.sessions) ||
+      !batch.sessions.length ||
+      (Array.isArray(batch.session_ids) && batch.sessions.length < batch.session_ids.length);
+    if (needListSweep) try {
       const all = await api("/accounts/register-email/sessions");
       if (all && Array.isArray(all.sessions)) {
         const trackedIds = new Set(
@@ -3839,9 +4166,14 @@ async function pollRegSession() {
             known.add(id);
             sessionHits += 1;
           } else {
-            // refresh existing
+            // Prefer the fresher message/status by updated_at when merging.
             const idx = sessions.findIndex((x) => regSessionKey(x) === id);
-            if (idx >= 0) sessions[idx] = s;
+            if (idx >= 0) {
+              const cur = sessions[idx] || {};
+              const curTs = Number(cur.updated_at || 0) || 0;
+              const nextTs = Number(s.updated_at || 0) || 0;
+              if (nextTs >= curTs) sessions[idx] = s;
+            }
           }
         }
         // Prefer batch stats from list endpoint when present.
@@ -3890,6 +4222,7 @@ async function pollRegSession() {
     const batchStatus = String(
       (batch && (batch.batch_status || batch.status)) || ""
     ).toLowerCase();
+    const batchRunningNow = Number((batch && batch.running) || 0) > 0;
     const batchDone =
       batch &&
       (batchStatus === "done" ||
@@ -3897,7 +4230,16 @@ async function pollRegSession() {
         batchStatus === "error" ||
         batchStatus === "cancelled" ||
         batchStatus === "stopped" ||
-        (Number(batch.done) > 0 && Number(batch.done) >= Number(batch.total || batch.count || 0)));
+        batchStatus === "failed" ||
+        // Counters say complete and nothing is still running.
+        (Number(batch.done || 0) > 0 &&
+          Number(batch.done || 0) >= Number(batch.total || batch.count || 0) &&
+          !batchRunningNow) ||
+        // Spawner counters already match target with no live workers (status lag).
+        (Number((batch.imported || 0) + (batch.error || 0) + (batch.cancelled || 0)) > 0 &&
+          Number((batch.imported || 0) + (batch.error || 0) + (batch.cancelled || 0)) >=
+            Number(batch.total || batch.count || 0) &&
+          !batchRunningNow));
     const batchStopping =
       !!regStopping ||
       batchStatus === "stopping" ||
@@ -3907,10 +4249,17 @@ async function pollRegSession() {
       sessions.length > 0 &&
       sessions.every((s) => REG_TERMINAL_OK.has(regStatusOf(s)) || REG_TERMINAL_BAD.has(regStatusOf(s)));
     // Prefer batch-level completion: large batches may only keep a compact session window in UI.
+    // Also finish when every observed session is terminal and batch reports no running workers,
+    // even if the UI only holds a compact window of sessions.
     const finished =
       !!batchDone ||
       (allTerminal &&
-        (targetTotal <= 0 || sessions.length >= targetTotal || !regBatchId || batchStopping));
+        !batchRunningNow &&
+        (targetTotal <= 0 ||
+          sessions.length >= targetTotal ||
+          !regBatchId ||
+          batchStopping ||
+          Number((batch && batch.done) || 0) >= targetTotal));
 
     // Fallback client-side probe for imported accounts missing backend probe.
     // Skip while stopping — no need to thrash the card with new probe lines mid-stop.
@@ -4011,6 +4360,11 @@ async function pollRegSession() {
   } catch (_) {}
   } finally {
     regPollInFlight = false;
+    // Drain trailing-edge request so a tick that arrived mid-flight still runs.
+    if (regPollPending && (regBatchId || regSessionId || (regSessionIds && regSessionIds.length))) {
+      regPollPending = false;
+      setTimeout(() => { pollRegSession().catch(() => {}); }, 50);
+    }
   }
 }
 
@@ -4516,11 +4870,47 @@ async function exportAllAccounts() {
 }
 
 async function importJsonFiles() {
-  const input = $("import-file");
+  return importAccountJsonFiles({
+    inputId: "import-file",
+    buttonId: "btn-import",
+    nameLabelId: "import-file-name",
+    label: "JSON",
+    emptyMsg: "请先选择 JSON 文件",
+  });
+}
+
+/** Import CLIProxyAPI auth files (same backend as JSON import; CPA auto-detected). */
+async function importCliproxyapiFiles() {
+  return importAccountJsonFiles({
+    inputId: "import-cliproxyapi-file",
+    buttonId: "btn-acc-import-cliproxyapi",
+    nameLabelId: null,
+    label: "CLIProxyAPI",
+    emptyMsg: "请选择 CLIProxyAPI 的 auth JSON（xai-*.json / type=xai|codex / bundle）",
+    forceMerge: true,
+  });
+}
+
+/**
+ * Shared multi-file import against /accounts/import-files.
+ * Used by generic JSON import and the dedicated CLIProxyAPI button.
+ */
+async function importAccountJsonFiles({
+  inputId = "import-file",
+  buttonId = "btn-import",
+  nameLabelId = "import-file-name",
+  label = "JSON",
+  emptyMsg = "请先选择文件",
+  forceMerge = null,
+} = {}) {
+  const input = $(inputId);
   const files = input && input.files;
-  if (!files || !files.length) return toast("请先选择 JSON 文件", false);
-  const merge = ($("import-merge") && $("import-merge").checked) ? "true" : "false";
-  const btn = $("btn-import");
+  if (!files || !files.length) return toast(emptyMsg, false);
+  let merge;
+  if (forceMerge === true) merge = "true";
+  else if (forceMerge === false) merge = "false";
+  else merge = ($("import-merge") && $("import-merge").checked) ? "true" : "false";
+  const btn = $(buttonId);
   if (btn) {
     btn.disabled = true;
     if (!btn.dataset.label) btn.dataset.label = btn.textContent;
@@ -4529,7 +4919,7 @@ async function importJsonFiles() {
   showJsonIoProgress(true);
   setJsonIoProgress({
     percent: 0,
-    label: `开始导入 ${files.length} 个 JSON…`,
+    label: `开始导入 ${files.length} 个 ${label} 文件…`,
     detail: "提交任务中",
     done: 0,
     total: files.length,
@@ -4537,7 +4927,11 @@ async function importJsonFiles() {
     fail: 0,
     status: "queued",
   });
-  setLogPanel("json-io-result", `开始导入 ${files.length} 个 JSON…\n提交后台任务…`, { forceShow: true });
+  setLogPanel(
+    "json-io-result",
+    `开始导入 ${files.length} 个 ${label} 文件…\n提交后台任务…`,
+    { forceShow: true }
+  );
   try {
     const fd = new FormData();
     for (let i = 0; i < files.length; i++) fd.append("files", files[i]);
@@ -4593,9 +4987,14 @@ async function importJsonFiles() {
         fail: totalFailed,
         status: totalFailed ? "partial" : "done",
       });
-      toast(files.length > 1 ? `批量导入完成：${totalImported} 账号，${totalFailed} 文件失败` : (lastMessage || `已导入 ${totalImported} 个账号`), totalFailed === 0);
+      toast(
+        files.length > 1
+          ? `${label} 导入完成：${totalImported} 账号，${totalFailed} 文件失败`
+          : (lastMessage || `已导入 ${totalImported} 个账号`),
+        totalFailed === 0
+      );
       if (input) input.value = "";
-      if ($("import-file-name")) $("import-file-name").textContent = "未选择文件";
+      if (nameLabelId && $(nameLabelId)) $(nameLabelId).textContent = "未选择文件";
       try { await loadAccountsPage({ reset: true }); } catch (_) { await loadDashboard(); }
       return;
     }
@@ -4613,9 +5012,12 @@ async function importJsonFiles() {
         fail: parseErrors,
         status: parseErrors ? "partial" : "done",
       });
-      toast(started.message || `导入完成：${count} 个账号` + (parseErrors ? `，${parseErrors} 个文件失败` : ""), parseErrors === 0);
+      toast(
+        started.message || `导入完成：${count} 个账号` + (parseErrors ? `，${parseErrors} 个文件失败` : ""),
+        parseErrors === 0
+      );
       if (input) input.value = "";
-      if ($("import-file-name")) $("import-file-name").textContent = "未选择文件";
+      if (nameLabelId && $(nameLabelId)) $(nameLabelId).textContent = "未选择文件";
       try { await loadAccountsPage({ reset: true }); } catch (_) { await loadDashboard(); }
       return;
     }
@@ -4644,11 +5046,11 @@ async function importJsonFiles() {
     }
     if (btn) btn.textContent = `导入中 ${finalJob.done || files.length}/${finalJob.total || files.length}`;
     toast(
-      finalJob.message || `导入完成：${finalJob.count || 0} 个账号`,
+      finalJob.message || `${label} 导入完成：${finalJob.count || 0} 个账号`,
       st !== "error" && !(finalJob.fail > 0 && !(finalJob.count > 0))
     );
     if (input) input.value = "";
-    if ($("import-file-name")) $("import-file-name").textContent = "未选择文件";
+    if (nameLabelId && $(nameLabelId)) $(nameLabelId).textContent = "未选择文件";
     try { await loadAccountsPage({ reset: true }); } catch (_) { await loadDashboard(); }
   } catch (e) {
     setJsonIoProgress({
@@ -4661,7 +5063,7 @@ async function importJsonFiles() {
   } finally {
     if (btn) {
       btn.disabled = false;
-      btn.textContent = btn.dataset.label || "导入文件";
+      btn.textContent = btn.dataset.label || (buttonId === "btn-acc-import-cliproxyapi" ? "导入 CLIProxyAPI" : "导入文件");
     }
   }
 }
@@ -5199,6 +5601,482 @@ on("btn-logout-cli", "onclick", async () => {  if (!confirm("注销全部 Grok �
 
 
 
+
+/* ── sub2api push ───────────────────────────────────── */
+function fillSub2apiForm(cfg) {
+  cfg = cfg || {};
+  if ($("set-sub2api-enabled")) $("set-sub2api-enabled").checked = !!cfg.enabled;
+  if ($("set-sub2api-url")) $("set-sub2api-url").value = cfg.base_url || "";
+  if ($("set-sub2api-email")) $("set-sub2api-email").value = cfg.email || "";
+  // never echo password; placeholder indicates saved state
+  if ($("set-sub2api-password")) {
+    $("set-sub2api-password").value = "";
+    $("set-sub2api-password").placeholder = cfg.has_password ? "已保存，留空不改" : "登录密码";
+  }
+  if ($("set-sub2api-group-id")) {
+    $("set-sub2api-group-id").value = cfg.group_id != null && cfg.group_id !== "" ? cfg.group_id : "";
+  }
+  if ($("set-sub2api-group-name")) $("set-sub2api-group-name").value = cfg.group_name || "";
+  if ($("set-sub2api-auto-group")) $("set-sub2api-auto-group").checked = cfg.auto_create_group !== false;
+  if ($("set-sub2api-auto-push-register")) {
+    $("set-sub2api-auto-push-register").checked = !!cfg.auto_push_on_register;
+  }
+  if ($("set-sub2api-concurrency")) $("set-sub2api-concurrency").value = cfg.concurrency != null ? cfg.concurrency : 4;
+  if ($("set-sub2api-account-concurrency")) {
+    const ac = cfg.account_concurrency != null ? cfg.account_concurrency : (cfg.account_capacity != null ? cfg.account_capacity : 3);
+    $("set-sub2api-account-concurrency").value = ac;
+  }
+  if ($("set-sub2api-account-priority")) {
+    $("set-sub2api-account-priority").value = cfg.account_priority != null ? cfg.account_priority : 50;
+  }
+  if ($("set-sub2api-account-rate")) {
+    $("set-sub2api-account-rate").value = cfg.account_rate_multiplier != null ? cfg.account_rate_multiplier : 1;
+  }
+  if ($("set-sub2api-notes")) $("set-sub2api-notes").value = cfg.notes_prefix || "grokcli-2api";
+  const pill = $("sub2api-pill");
+  if (pill) {
+    if (cfg.base_url && cfg.has_password) {
+      pill.textContent = "已配置";
+      pill.className = "g2a-tag g2a-tag-ok";
+    } else if (cfg.base_url) {
+      pill.textContent = "缺密码";
+      pill.className = "g2a-tag g2a-tag-warn";
+    } else {
+      pill.textContent = "未配置";
+      pill.className = "g2a-tag";
+    }
+  }
+}
+
+function fillCliproxyapiForm(cfg) {
+  cfg = cfg || {};
+  if ($("set-cliproxyapi-enabled")) $("set-cliproxyapi-enabled").checked = !!cfg.enabled;
+  if ($("set-cliproxyapi-url")) $("set-cliproxyapi-url").value = cfg.base_url || "";
+  if ($("set-cliproxyapi-key")) {
+    $("set-cliproxyapi-key").value = "";
+    $("set-cliproxyapi-key").placeholder = cfg.has_management_key ? "已保存，留空不改" : "Management Key";
+  }
+  if ($("set-cliproxyapi-auto-push-register")) {
+    $("set-cliproxyapi-auto-push-register").checked = !!cfg.auto_push_on_register;
+  }
+  if ($("set-cliproxyapi-concurrency")) {
+    $("set-cliproxyapi-concurrency").value = cfg.concurrency != null ? cfg.concurrency : 4;
+  }
+  if ($("set-cliproxyapi-auth-type")) {
+    $("set-cliproxyapi-auth-type").value = cfg.auth_type || "xai";
+  }
+  if ($("set-cliproxyapi-base-upstream")) {
+    $("set-cliproxyapi-base-upstream").value =
+      cfg.base_upstream || "https://cli-chat-proxy.grok.com/v1";
+  }
+  if ($("set-cliproxyapi-notes")) {
+    $("set-cliproxyapi-notes").value = cfg.notes_prefix || "grokcli-2api";
+  }
+  const pill = $("cliproxyapi-pill");
+  if (pill) {
+    if (cfg.base_url && cfg.has_management_key) {
+      pill.textContent = "已配置";
+      pill.className = "g2a-tag g2a-tag-ok";
+    } else if (cfg.base_url) {
+      pill.textContent = "缺 Key";
+      pill.className = "g2a-tag g2a-tag-warn";
+    } else {
+      pill.textContent = "未配置";
+      pill.className = "g2a-tag";
+    }
+  }
+}
+
+function collectCliproxyapiPatch() {
+  if (!$("set-cliproxyapi-url") && !$("set-cliproxyapi-key")) return null;
+  const patch = {
+    enabled: !!( $("set-cliproxyapi-enabled") && $("set-cliproxyapi-enabled").checked ),
+    base_url: $("set-cliproxyapi-url") ? ($("set-cliproxyapi-url").value || "").trim() : "",
+    auto_push_on_register: !!(
+      $("set-cliproxyapi-auto-push-register") && $("set-cliproxyapi-auto-push-register").checked
+    ),
+    notes_prefix: $("set-cliproxyapi-notes")
+      ? (($("set-cliproxyapi-notes").value || "").trim() || "grokcli-2api")
+      : "grokcli-2api",
+    auth_type: $("set-cliproxyapi-auth-type")
+      ? ($("set-cliproxyapi-auth-type").value || "xai")
+      : "xai",
+    base_upstream: $("set-cliproxyapi-base-upstream")
+      ? (($("set-cliproxyapi-base-upstream").value || "").trim() ||
+          "https://cli-chat-proxy.grok.com/v1")
+      : "https://cli-chat-proxy.grok.com/v1",
+  };
+  const conc = $("set-cliproxyapi-concurrency")
+    ? ($("set-cliproxyapi-concurrency").value || "").trim()
+    : "";
+  if (conc !== "") patch.concurrency = Number(conc);
+  const key = $("set-cliproxyapi-key") ? ($("set-cliproxyapi-key").value || "") : "";
+  if (key) patch.management_key = key;
+  return patch;
+}
+
+async function saveCliproxyapiConfig(opts) {
+  opts = opts || {};
+  const patch = collectCliproxyapiPatch() || {};
+  if (opts.test) patch.test = true;
+  const r = await api("/settings/cliproxyapi", {
+    method: "PUT",
+    body: JSON.stringify(patch),
+  });
+  if (r && r.config) fillCliproxyapiForm(r.config);
+  if (r && r.ok === false) {
+    throw new Error((r.test && r.test.error) || r.error || "CLIProxyAPI 配置保存失败");
+  }
+  return r;
+}
+
+async function testCliproxyapiConnection() {
+  const pre = $("cliproxyapi-test-result");
+  if (pre) {
+    pre.style.display = "block";
+    pre.textContent = "测试中…";
+  }
+  try {
+    await saveCliproxyapiConfig({});
+    const r = await api("/settings/cliproxyapi/test", { method: "POST", body: "{}" });
+    if (pre) pre.textContent = JSON.stringify(r, null, 2);
+    const ok = !!(r && (r.ok || (r.test && r.test.ok)));
+    const msg = ok
+      ? (r.test && r.test.message) || r.message || "连接成功"
+      : (r && r.test && r.test.error) || (r && r.error) || "失败";
+    toast(msg, !ok);
+    return r;
+  } catch (e) {
+    if (pre) pre.textContent = String(e.message || e);
+    toast(e.message || String(e), true);
+    throw e;
+  }
+}
+
+async function pushAccountsToCliproxyapi({ all = false } = {}) {
+  let body;
+  if (all) {
+    if (!confirm("确认将【全部账号】同步导入到 CLIProxyAPI？")) return;
+    body = { all: true };
+  } else {
+    const ids = Array.from(selectedAccountIds || []);
+    if (!ids.length) {
+      toast("请先勾选要导入的账号", false);
+      return;
+    }
+    if (!confirm(`确认将选中的 ${ids.length} 个账号同步导入到 CLIProxyAPI？`)) return;
+    body = { account_ids: ids };
+  }
+  toast(all ? "正在同步全部账号到 CLIProxyAPI…" : "正在同步选中账号到 CLIProxyAPI…");
+  try {
+    const r = await api("/accounts/push-cliproxyapi", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    const ok = r && r.success != null ? r.success : 0;
+    const fail = r && r.failed != null ? r.failed : 0;
+    const total = r && r.total != null ? r.total : ok + fail;
+    toast(
+      r.message || `CLIProxyAPI 导入完成：成功 ${ok} / 失败 ${fail} / 共 ${total}`,
+      fail !== 0
+    );
+    if (fail && r && Array.isArray(r.results)) {
+      const firstErr = r.results.find((x) => x && !x.ok);
+      if (firstErr) console.warn("cliproxyapi push sample error", firstErr);
+    }
+    return r;
+  } catch (e) {
+    toast(e.message || String(e), false);
+    throw e;
+  }
+}
+
+function collectSub2apiPatch() {
+  if (!$("set-sub2api-url") && !$("set-sub2api-email")) return null;
+  const patch = {
+    enabled: !!( $("set-sub2api-enabled") && $("set-sub2api-enabled").checked ),
+    base_url: $("set-sub2api-url") ? ($("set-sub2api-url").value || "").trim() : "",
+    email: $("set-sub2api-email") ? ($("set-sub2api-email").value || "").trim() : "",
+    group_name: $("set-sub2api-group-name") ? ($("set-sub2api-group-name").value || "").trim() : "",
+    auto_create_group: !!( $("set-sub2api-auto-group") && $("set-sub2api-auto-group").checked ),
+    auto_push_on_register: !!(
+      $("set-sub2api-auto-push-register") && $("set-sub2api-auto-push-register").checked
+    ),
+    notes_prefix: $("set-sub2api-notes") ? (($("set-sub2api-notes").value || "").trim() || "grokcli-2api") : "grokcli-2api",
+  };
+  const gid = $("set-sub2api-group-id") ? ($("set-sub2api-group-id").value || "").trim() : "";
+  if (gid !== "") patch.group_id = Number(gid);
+  else patch.group_id = null;
+  const conc = $("set-sub2api-concurrency") ? ($("set-sub2api-concurrency").value || "").trim() : "";
+  if (conc !== "") patch.concurrency = Number(conc);
+  const accConc = $("set-sub2api-account-concurrency") ? ($("set-sub2api-account-concurrency").value || "").trim() : "";
+  if (accConc !== "") patch.account_concurrency = Number(accConc);
+  const accPrio = $("set-sub2api-account-priority") ? ($("set-sub2api-account-priority").value || "").trim() : "";
+  if (accPrio !== "") patch.account_priority = Number(accPrio);
+  const accRate = $("set-sub2api-account-rate") ? ($("set-sub2api-account-rate").value || "").trim() : "";
+  if (accRate !== "") patch.account_rate_multiplier = Number(accRate);
+  const pw = $("set-sub2api-password") ? ($("set-sub2api-password").value || "") : "";
+  if (pw) patch.password = pw;
+  return patch;
+}
+
+function renderSub2apiGroups(groups) {
+  const sel = $("set-sub2api-group-select");
+  if (!sel) return;
+  const cur = $("set-sub2api-group-id") ? String($("set-sub2api-group-id").value || "") : "";
+  const items = Array.isArray(groups) ? groups : [];
+  sel.innerHTML = '<option value="">— 选择已有分组 —</option>' + items.map((g) => {
+    const id = g && g.id != null ? String(g.id) : "";
+    const name = (g && (g.name || g.title)) || id;
+    const plat = g && g.platform ? ` [${g.platform}]` : "";
+    const selected = id && id === cur ? " selected" : "";
+    return `<option value="${esc(id)}"${selected}>#${esc(id)} ${esc(name)}${esc(plat)}</option>`;
+  }).join("");
+}
+
+async function saveSub2apiConfig(opts) {
+  opts = opts || {};
+  const patch = collectSub2apiPatch() || {};
+  if (opts.test) patch.test = true;
+  // Always persist via dedicated endpoint so secrets land even if main
+  // "保存设置" path is skipped or soft-nav form is partial.
+  const r = await api("/settings/sub2api", { method: "PUT", body: JSON.stringify(patch) });
+  if (r && r.config) fillSub2apiForm(r.config);
+  if (r && r.test && Array.isArray(r.test.groups)) renderSub2apiGroups(r.test.groups);
+  if (r && r.ok === false) {
+    throw new Error((r.test && r.test.error) || r.error || "sub2api 配置保存失败");
+  }
+  return r;
+}
+
+async function testSub2apiConnection() {
+  const pre = $("sub2api-test-result");
+  if (pre) { pre.style.display = "block"; pre.textContent = "测试中…"; }
+  try {
+    // Save current form first (password optional if already stored)
+    await saveSub2apiConfig({});
+    const r = await api("/settings/sub2api/test", { method: "POST", body: "{}" });
+    if (pre) pre.textContent = JSON.stringify(r, null, 2);
+    if (r && Array.isArray(r.groups)) renderSub2apiGroups(r.groups);
+    toast(r && r.ok ? `连接成功，${r.group_count || 0} 个分组` : (r && r.error) || "失败", !(r && r.ok));
+    return r;
+  } catch (e) {
+    if (pre) pre.textContent = String(e.message || e);
+    toast(e.message || String(e), true);
+    throw e;
+  }
+}
+
+async function loadSub2apiGroups() {
+  const pre = $("sub2api-test-result");
+  if (pre) { pre.style.display = "block"; pre.textContent = "刷新分组中…"; }
+  try {
+    try {
+      await saveSub2apiConfig({});
+    } catch (e) {
+      // still try list with previously saved config
+      console.warn("save before groups failed", e);
+    }
+    const r = await api("/settings/sub2api/groups");
+    renderSub2apiGroups((r && r.groups) || []);
+    if (pre) pre.textContent = JSON.stringify(r, null, 2);
+    toast(`已加载 ${(r && r.count) || 0} 个分组`);
+    return r;
+  } catch (e) {
+    if (pre) pre.textContent = String(e.message || e);
+    toast(e.message || String(e), true);
+    throw e;
+  }
+}
+
+async function createSub2apiGroup() {
+  const name = prompt("新分组名称", ($("set-sub2api-group-name") && $("set-sub2api-group-name").value) || "grokcli-2api");
+  if (!name) return;
+  try { await saveSub2apiConfig({}); } catch (_) {}
+  const r = await api("/settings/sub2api/groups", {
+    method: "POST",
+    body: JSON.stringify({ name, platform: "grok", set_default: true }),
+  });
+  if (r && r.config) fillSub2apiForm(r.config);
+  toast(r && r.ok ? `分组已创建 #${(r.group && r.group.id) || "?"}` : "创建失败", !(r && r.ok));
+  try { await loadSub2apiGroups(); } catch (_) {}
+  return r;
+}
+
+async function pushAccountsToSub2api({ all = false } = {}) {
+  let body;
+  if (all) {
+    if (!confirm("确认将【全部账号】导入到 sub2api？")) return;
+    body = { all: true };
+  } else {
+    const ids = Array.from(selectedAccountIds || []);
+    if (!ids.length) {
+      toast("请先勾选要导入的账号", false);
+      return;
+    }
+    if (!confirm(`确认将选中的 ${ids.length} 个账号导入到 sub2api？`)) return;
+    body = { account_ids: ids };
+  }
+  // optional override from settings form if present
+  const gid = $("set-sub2api-group-id") ? ($("set-sub2api-group-id").value || "").trim() : "";
+  if (gid) body.group_id = Number(gid);
+  toast(all ? "正在导入全部账号到 sub2api…" : "正在导入选中账号到 sub2api…");
+  try {
+    const r = await api("/accounts/push-sub2api", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    const ok = r && r.success != null ? r.success : 0;
+    const fail = r && r.failed != null ? r.failed : 0;
+    const total = r && r.total != null ? r.total : ok + fail;
+    toast(`sub2api 导入完成：成功 ${ok} / 失败 ${fail} / 共 ${total}`, fail !== 0);
+    if (fail && r && Array.isArray(r.results)) {
+      const firstErr = r.results.find((x) => x && !x.ok);
+      if (firstErr) console.warn("sub2api push sample error", firstErr);
+    }
+    return r;
+  } catch (e) {
+    toast(e.message || String(e), false);
+    throw e;
+  }
+}
+
+async function exportSub2apiFormat() {
+  const ids = Array.from(selectedAccountIds || []);
+  const body = ids.length ? { account_ids: ids } : { all: true };
+  if (!ids.length && !confirm("未选择账号，将导出全部账号为 sub2api 数据备份 JSON（type=sub2api-data）。继续？")) return;
+  try {
+    const r = await api("/accounts/export-sub2api-format", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    // Backend now returns pure DataPayload {type,version,proxies,accounts}.
+    // Fall back if an older server wrapped it.
+    let payload = r;
+    if (r && r.accounts && r.type !== "sub2api-data" && r.type !== "sub2api-bundle") {
+      // legacy CreateAccountRequest[] wrapper → convert client-side
+      const rows = Array.isArray(r.accounts) ? r.accounts : [];
+      payload = {
+        type: "sub2api-data",
+        version: 1,
+        exported_at: new Date().toISOString(),
+        proxies: [],
+        accounts: rows.map((row) => ({
+          name: row.name || row.email || "grok-account",
+          notes: row.notes || null,
+          platform: row.platform || "grok",
+          type: row.type || "oauth",
+          credentials: row.credentials || {},
+          extra: row.extra || {},
+          concurrency: row.concurrency != null ? row.concurrency : 3,
+          priority: row.priority != null ? row.priority : 50,
+          rate_multiplier: row.rate_multiplier != null ? row.rate_multiplier : 1.0,
+        })),
+      };
+    }
+    if (!payload || !Array.isArray(payload.accounts) || !Array.isArray(payload.proxies)) {
+      throw new Error("导出结果不是 sub2api-data 格式");
+    }
+    if (!payload.type) payload.type = "sub2api-data";
+    if (!payload.version) payload.version = 1;
+    if (!payload.exported_at) payload.exported_at = new Date().toISOString();
+    const count = payload.accounts.length;
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    // Name matches sub2api's own export convention so users recognize it.
+    a.download = `sub2api-data-${Date.now()}.json`;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+    toast(`已导出 sub2api-data：${count} 个账号（可在 sub2api「导入数据」中使用）`);
+  } catch (e) {
+    toast(e.message || String(e), true);
+  }
+}
+
+async function exportCliproxyapiFormat() {
+  const ids = Array.from(selectedAccountIds || []);
+  const body = ids.length ? { account_ids: ids } : { all: true };
+  if (
+    !ids.length &&
+    !confirm(
+      "未选择账号，将导出全部账号为 CLIProxyAPI auth 包（type=cliproxyapi-auth-bundle）。继续？"
+    )
+  ) {
+    return;
+  }
+  try {
+    const r = await api("/accounts/export-cliproxyapi-format", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    let payload = r;
+    if (!payload || payload.type !== "cliproxyapi-auth-bundle") {
+      // tolerate accidental wrappers
+      if (r && Array.isArray(r.accounts)) {
+        payload = {
+          type: "cliproxyapi-auth-bundle",
+          version: 1,
+          exported_at: new Date().toISOString(),
+          source: "grokcli-2api",
+          accounts: r.accounts,
+        };
+      }
+    }
+    if (!payload || !Array.isArray(payload.accounts)) {
+      throw new Error("导出结果不是 cliproxyapi-auth-bundle 格式");
+    }
+    if (!payload.type) payload.type = "cliproxyapi-auth-bundle";
+    if (!payload.version) payload.version = 1;
+    if (!payload.exported_at) payload.exported_at = new Date().toISOString();
+    const count = payload.accounts.length;
+    const blob = new Blob([JSON.stringify(payload, null, 2)], {
+      type: "application/json",
+    });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `cliproxyapi-auth-bundle-${Date.now()}.json`;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => {
+      URL.revokeObjectURL(a.href);
+      a.remove();
+    }, 1000);
+    toast(
+      `已导出 CLIProxyAPI：${count} 个账号（可再「导入文件」回本系统，或拆成单文件放进 CPA auth 目录）`
+    );
+  } catch (e) {
+    toast(e.message || String(e), true);
+  }
+}
+
+function bindSub2apiUi() {
+  on("btn-sub2api-test", "onclick", () => { testSub2apiConnection().catch(() => {}); });
+  on("btn-sub2api-load-groups", "onclick", () => { loadSub2apiGroups().catch((e) => toast(e.message || String(e), true)); });
+  on("btn-sub2api-create-group", "onclick", () => { createSub2apiGroup().catch((e) => toast(e.message || String(e), true)); });
+  on("set-sub2api-group-select", "onchange", () => {
+    const sel = $("set-sub2api-group-select");
+    if (!sel || !sel.value) return;
+    if ($("set-sub2api-group-id")) $("set-sub2api-group-id").value = sel.value;
+    const opt = sel.options[sel.selectedIndex];
+    if (opt && $("set-sub2api-group-name")) {
+      // option text: #id name [platform]
+      const t = (opt.textContent || "").replace(/^#\S+\s*/, "").replace(/\s*\[.*\]\s*$/, "").trim();
+      if (t) $("set-sub2api-group-name").value = t;
+    }
+  });
+  on("btn-acc-push-sub2api-selected", "onclick", () => { pushAccountsToSub2api({ all: false }).catch(() => {}); });
+  on("btn-acc-push-sub2api-all", "onclick", () => { pushAccountsToSub2api({ all: true }).catch(() => {}); });
+  on("btn-acc-export-sub2api-format", "onclick", () => { exportSub2apiFormat().catch(() => {}); });
+  on("btn-acc-export-cliproxyapi-format", "onclick", () => { exportCliproxyapiFormat().catch(() => {}); });
+  on("btn-acc-push-cliproxyapi-selected", "onclick", () => { pushAccountsToCliproxyapi({ all: false }).catch(() => {}); });
+  on("btn-acc-push-cliproxyapi-all", "onclick", () => { pushAccountsToCliproxyapi({ all: true }).catch(() => {}); });
+  on("btn-cliproxyapi-test", "onclick", () => { testCliproxyapiConnection().catch(() => {}); });
+}
+// bind once when DOM ready (core.js loads at end of body)
+try { bindSub2apiUi(); } catch (_) {}
+
 /* ── System settings page ───────────────────────────── */
 function fillSystemSettingsForm(s) {
   s = s || {};
@@ -5206,12 +6084,43 @@ function fillSystemSettingsForm(s) {
   if ($("set-default-model")) $("set-default-model").value = s.default_model || "";
   if ($("set-token-maintain")) $("set-token-maintain").checked = s.token_maintain_enabled !== false;
   if ($("set-model-health")) $("set-model-health").checked = s.model_health_enabled !== false;
+  if ($("set-model-health-auto-disable")) {
+    $("set-model-health-auto-disable").checked = s.model_health_auto_disable !== false;
+  }
   if ($("set-affinity")) $("set-affinity").checked = s.conversation_affinity_enabled !== false;
+  if ($("set-token-maintain-interval") && s.token_maintain_interval_sec != null) {
+    $("set-token-maintain-interval").value = s.token_maintain_interval_sec;
+  }
+  if ($("set-token-refresh-skew") && s.token_refresh_skew_sec != null) {
+    $("set-token-refresh-skew").value = s.token_refresh_skew_sec;
+  }
+  if ($("set-model-health-interval") && s.model_health_interval_sec != null) {
+    $("set-model-health-interval").value = s.model_health_interval_sec;
+  }
+  if ($("set-affinity-ttl") && s.conversation_affinity_ttl_sec != null) {
+    $("set-affinity-ttl").value = s.conversation_affinity_ttl_sec;
+  }
+  if ($("set-probe-models")) {
+    const pm = s.probe_models;
+    $("set-probe-models").value = Array.isArray(pm) ? pm.join(", ") : (pm || "");
+  }
   if ($("set-reasoning") && s.reasoning_compat) $("set-reasoning").value = s.reasoning_compat;
   if ($("set-max-tools")) $("set-max-tools").value = (s.outbound_max_tools != null ? s.outbound_max_tools : 1);
+  if ($("set-max-tools-openai")) {
+    $("set-max-tools-openai").value = (s.outbound_max_tools_openai != null ? s.outbound_max_tools_openai : 0);
+  }
   if ($("set-tool-gap")) $("set-tool-gap").value = (s.outbound_tool_gap_sec != null ? s.outbound_tool_gap_sec : 0.08);
   if ($("set-sse-keepalive")) $("set-sse-keepalive").value = (s.sse_keepalive != null ? s.sse_keepalive : 8);
   if ($("set-history-compact")) $("set-history-compact").checked = !!s.history_compact_enabled;
+  if ($("set-history-auto-chars") && s.history_compact_auto_chars != null) {
+    $("set-history-auto-chars").value = s.history_compact_auto_chars;
+  }
+  if ($("set-history-keep-rounds") && s.history_keep_tool_rounds != null) {
+    $("set-history-keep-rounds").value = s.history_keep_tool_rounds;
+  }
+  if ($("set-history-tool-max") && s.history_max_tool_result_chars != null) {
+    $("set-history-tool-max").value = s.history_max_tool_result_chars;
+  }
   const pol = s.pool_policy || s;
   if ($("set-cd-default") && pol.cooldown_default_sec != null) $("set-cd-default").value = pol.cooldown_default_sec;
   if ($("set-cd-auth") && pol.cooldown_auth_sec != null) $("set-cd-auth").value = pol.cooldown_auth_sec;
@@ -5238,6 +6147,9 @@ function fillSystemSettingsForm(s) {
       st === "random" ? "random" : st === "sticky" ? "sticky" : "round_robin";
   }
   try { updateOutboundProxyHint(s); } catch (_) {}
+  // sub2api push config
+  try { fillSub2apiForm(s && s.sub2api_config); } catch (_) {}
+  try { fillCliproxyapiForm(s && s.cliproxyapi_config); } catch (_) {}
   const pill = $("pwd-env-pill");
   if (pill) {
     if (s.admin_password_in_store || (s.has_admin_password && !s.admin_password_from_env)) {
@@ -5283,10 +6195,31 @@ function collectSystemSettingsPatch() {
   if ($("set-default-model")) patch.default_model = ($("set-default-model").value || "").trim();
   if ($("set-token-maintain")) patch.token_maintain_enabled = !!$("set-token-maintain").checked;
   if ($("set-model-health")) patch.model_health_enabled = !!$("set-model-health").checked;
+  if ($("set-model-health-auto-disable")) {
+    patch.model_health_auto_disable = !!$("set-model-health-auto-disable").checked;
+  }
   if ($("set-affinity")) patch.conversation_affinity_enabled = !!$("set-affinity").checked;
+  if ($("set-token-maintain-interval") && $("set-token-maintain-interval").value !== "") {
+    patch.token_maintain_interval_sec = Number($("set-token-maintain-interval").value);
+  }
+  if ($("set-token-refresh-skew") && $("set-token-refresh-skew").value !== "") {
+    patch.token_refresh_skew_sec = Number($("set-token-refresh-skew").value);
+  }
+  if ($("set-model-health-interval") && $("set-model-health-interval").value !== "") {
+    patch.model_health_interval_sec = Number($("set-model-health-interval").value);
+  }
+  if ($("set-affinity-ttl") && $("set-affinity-ttl").value !== "") {
+    patch.conversation_affinity_ttl_sec = Number($("set-affinity-ttl").value);
+  }
+  if ($("set-probe-models")) {
+    patch.probe_models = ($("set-probe-models").value || "").trim();
+  }
   if ($("set-reasoning")) patch.reasoning_compat = $("set-reasoning").value;
   if ($("set-max-tools") && $("set-max-tools").value !== "") {
     patch.outbound_max_tools = Number($("set-max-tools").value);
+  }
+  if ($("set-max-tools-openai") && $("set-max-tools-openai").value !== "") {
+    patch.outbound_max_tools_openai = Number($("set-max-tools-openai").value);
   }
   if ($("set-tool-gap") && $("set-tool-gap").value !== "") {
     patch.outbound_tool_gap_sec = Number($("set-tool-gap").value);
@@ -5295,6 +6228,15 @@ function collectSystemSettingsPatch() {
     patch.sse_keepalive = Number($("set-sse-keepalive").value);
   }
   if ($("set-history-compact")) patch.history_compact_enabled = !!$("set-history-compact").checked;
+  if ($("set-history-auto-chars") && $("set-history-auto-chars").value !== "") {
+    patch.history_compact_auto_chars = Number($("set-history-auto-chars").value);
+  }
+  if ($("set-history-keep-rounds") && $("set-history-keep-rounds").value !== "") {
+    patch.history_keep_tool_rounds = Number($("set-history-keep-rounds").value);
+  }
+  if ($("set-history-tool-max") && $("set-history-tool-max").value !== "") {
+    patch.history_max_tool_result_chars = Number($("set-history-tool-max").value);
+  }
   if ($("set-cd-default") && $("set-cd-default").value !== "") patch.cooldown_default_sec = Number($("set-cd-default").value);
   if ($("set-cd-auth") && $("set-cd-auth").value !== "") patch.cooldown_auth_sec = Number($("set-cd-auth").value);
   if ($("set-cd-429") && $("set-cd-429").value !== "") patch.cooldown_rate_limit_sec = Number($("set-cd-429").value);
@@ -5316,12 +6258,22 @@ function collectSystemSettingsPatch() {
     if (pw) patch.outbound_proxy_password = pw;
   }
   if ($("set-outbound-proxy-strategy")) patch.outbound_proxy_strategy = $("set-outbound-proxy-strategy").value || "round_robin";
+  // sub2api
+  try {
+    const s2 = collectSub2apiPatch();
+    if (s2) patch.sub2api_config = s2;
+  } catch (_) {}
+  // CLIProxyAPI
+  try {
+    const cpa = collectCliproxyapiPatch();
+    if (cpa) patch.cliproxyapi_config = cpa;
+  } catch (_) {}
   return patch;
 }
 
 function countOutboundProxyLines(text) {
   return String(text || "")
-    .split(/\r?\n|;/)
+    .split(/\r?\n|;|,/)
     .map((s) => s.trim())
     .filter((s) => s && !s.startsWith("#"))
     .length;
@@ -5378,13 +6330,52 @@ async function saveSystemSettings() {
     if (patch.outbound_tool_gap_sec != null && (Number.isNaN(patch.outbound_tool_gap_sec) || patch.outbound_tool_gap_sec < 0)) {
       throw new Error("工具间隔无效");
     }
+    // Persist sub2api via dedicated endpoint FIRST so password is never dropped
+    // by the redacted public settings response from PUT /settings.
+    let s2err = null;
+    let cpaErr = null;
+    try {
+      if ($("set-sub2api-url") || $("set-sub2api-email")) {
+        await saveSub2apiConfig({});
+      }
+    } catch (e) {
+      s2err = e;
+      console.warn("sub2api save failed", e);
+    }
+    try {
+      if ($("set-cliproxyapi-url") || $("set-cliproxyapi-key")) {
+        await saveCliproxyapiConfig({});
+      }
+    } catch (e) {
+      cpaErr = e;
+      console.warn("cliproxyapi save failed", e);
+    }
+    // Avoid double-writing / redacting secrets through general settings path.
+    if (patch.sub2api_config) delete patch.sub2api_config;
+    if (patch.cliproxyapi_config) delete patch.cliproxyapi_config;
     const r = await api("/settings", { method: "PUT", body: JSON.stringify(patch) });
     const s = (r && r.settings) || patch;
     if (dashCache) dashCache.settings = Object.assign({}, dashCache.settings || {}, s);
     if (statusCache) statusCache.settings = Object.assign({}, statusCache.settings || {}, s);
     fillSystemSettingsForm(s);
+    // Re-fill sub2api from dedicated GET so has_password/url stay accurate.
+    try {
+      const s2 = await api("/settings/sub2api");
+      if (s2 && s2.config) fillSub2apiForm(s2.config);
+    } catch (_) {}
+    try {
+      const cpa = await api("/settings/cliproxyapi");
+      if (cpa && cpa.config) fillCliproxyapiForm(cpa.config);
+    } catch (_) {}
     try { await refreshOverviewStatus({ force: true, render: true }); } catch (_) {}
-    toast("设置已保存");
+    if (s2err || cpaErr) {
+      const parts = [];
+      if (s2err) parts.push("sub2api: " + (s2err.message || s2err));
+      if (cpaErr) parts.push("CLIProxyAPI: " + (cpaErr.message || cpaErr));
+      toast("其它设置已保存，但 " + parts.join("；"), true);
+    } else {
+      toast("设置已保存");
+    }
     try { await loadDashboard(); } catch (_) {}
     return s;
   } finally {
@@ -5546,7 +6537,7 @@ if ($("btn-start-reg")) {
         }
         saveRegTrack();
         setTimeout(() => { loadRegConfig(true).catch(() => {}); }, 300);
-        startRegPolling({ immediate: true, intervalMs: 2000 });
+        startRegPolling({ immediate: true, intervalMs: 1000 });
         if (r.batch_id) {
           setTimeout(async () => {
             try {
@@ -5736,7 +6727,7 @@ async function loadUsageEvents({ reset = false } = {}) {
   const protocol = ($("usage-events-protocol") && $("usage-events-protocol").value) || "all";
   const ok = ($("usage-events-ok") && $("usage-events-ok").value) || "all";
   usageEventsPageSize = parseInt(($("usage-events-page-size") && $("usage-events-page-size").value) || "50", 10) || 50;
-  $("usage-events-tbody").innerHTML = `<tr><td colspan="13" class="g2a-muted">加载明细中…</td></tr>`;
+  $("usage-events-tbody").innerHTML = `<tr><td colspan="14" class="g2a-muted">加载明细中…</td></tr>`;
   if ($("usage-events-info")) $("usage-events-info").textContent = "查询中…";
   try {
     const params = new URLSearchParams({
@@ -5762,7 +6753,7 @@ async function loadUsageEvents({ reset = false } = {}) {
     }
     if (!items.length) {
       $("usage-events-tbody").innerHTML =
-        `<tr><td colspan="13" class="g2a-muted">暂无请求明细（新请求完成后会出现在这里）</td></tr>`;
+        `<tr><td colspan="14" class="g2a-muted">暂无请求明细（新请求完成后会出现在这里）</td></tr>`;
       return;
     }
     const fmtLatency = (ms) => {
@@ -5789,6 +6780,25 @@ async function loadUsageEvents({ reset = false } = {}) {
       if (hitPct != null) cacheParts.push(`命中 ${hitPct}%`);
       const cacheSub = cacheParts.join(" / ");
       const reasoningTokens = Number(it.reasoning_tokens || 0);
+      const effortRaw = (
+        it.reasoning_effort
+        || (it.detail && (it.detail.reasoning_effort || it.detail.thinking_intensity || it.detail.thinking_effort))
+        || ""
+      );
+      // Show canonical English labels (low / medium / high / xhigh).
+      const effort = String(effortRaw || "").trim().toLowerCase();
+      let effortPill;
+      if (!effort) {
+        effortPill = '<span class="g2a-muted">—</span>';
+      } else if (effort === "low") {
+        effortPill = `<span class="g2a-tag" title="reasoning_effort: ${esc(effort)}">${esc(effort)}</span>`;
+      } else if (effort === "medium") {
+        effortPill = `<span class="g2a-tag warn" title="reasoning_effort: ${esc(effort)}">${esc(effort)}</span>`;
+      } else if (effort === "high" || effort === "xhigh") {
+        effortPill = `<span class="g2a-tag bad" title="reasoning_effort: ${esc(effort)}">${esc(effort)}</span>`;
+      } else {
+        effortPill = `<span class="g2a-tag" title="reasoning_effort: ${esc(effort)}">${esc(effort)}</span>`;
+      }
       const ttftMs = it.ttft_ms != null
         ? it.ttft_ms
         : (it.detail && it.detail.ttft_ms != null ? it.detail.ttft_ms : null);
@@ -5817,6 +6827,8 @@ async function loadUsageEvents({ reset = false } = {}) {
         cache_read_tokens: it.cache_read_tokens,
         cache_creation_tokens: it.cache_creation_tokens,
         reasoning_tokens: it.reasoning_tokens,
+        reasoning_effort: effort || "",
+        thinking_intensity: effort || "",
         client_ip: it.client_ip,
         user_agent: it.user_agent,
         status_code: it.status_code,
@@ -5837,6 +6849,7 @@ async function loadUsageEvents({ reset = false } = {}) {
         <td class="mono">${fmtNum(it.total_tokens)}</td>
         <td class="mono" style="font-size:12px">${cacheTokens > 0 ? fmtNum(cacheTokens) : "—"}${cacheSub ? `<div class="g2a-muted" style="font-size:11px">${esc(cacheSub)}</div>` : ""}</td>
         <td class="mono">${reasoningTokens > 0 ? fmtNum(reasoningTokens) : "—"}</td>
+        <td style="font-size:12px;text-align:center">${effortPill}</td>
         <td class="mono" style="font-size:12px" title="首字延迟 TTFT">${esc(fmtLatency(ttftMs))}</td>
         <td class="mono" style="font-size:12px" title="请求完成总耗时">${esc(fmtLatency(doneMs))}</td>
         <td>${okPill}</td>
@@ -5846,7 +6859,7 @@ async function loadUsageEvents({ reset = false } = {}) {
     if (seq !== usageEventsLoadSeq) return;
     console.warn("loadUsageEvents", e);
     $("usage-events-tbody").innerHTML =
-      `<tr><td colspan="13" class="g2a-muted">加载失败：${esc((e && e.message) || e)}</td></tr>`;
+      `<tr><td colspan="14" class="g2a-muted">加载失败：${esc((e && e.message) || e)}</td></tr>`;
     if ($("usage-events-info")) $("usage-events-info").textContent = "加载失败";
     toast((e && e.message) || "加载使用明细失败", false);
   } finally {
@@ -6166,4 +7179,4 @@ window.G2AAdmin = { bootstrap, loadDashboard, api, $, toast, PAGE_META, renderAc
     else bootstrap();
   }
 })();
-/* g2a-cache-bust-20260712-local-solver */
+/* g2a-cache-bust-20260715-reg-restore-fix */

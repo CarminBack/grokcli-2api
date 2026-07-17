@@ -88,9 +88,9 @@ fi
 
 echo "== run migrator =="
 if command -v python3 >/dev/null 2>&1; then
-  python3 migrate_json_to_pg.py "${ARGS[@]}"
+  python3 scripts/migrate_json_to_pg.py "${ARGS[@]}"
 else
-  python migrate_json_to_pg.py "${ARGS[@]}"
+  python scripts/migrate_json_to_pg.py "${ARGS[@]}"
 fi
 
 echo

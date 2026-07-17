@@ -50,7 +50,8 @@ docker compose up -d redis postgres
 docker compose run --rm \
   -e DATABASE_URL=postgresql://grok2api:grok2api@postgres:5432/grok2api \
   grokcli-2api \
-  python migrate_json_to_pg.py --data-dir /app/data --merge-pool
+  python scripts/migrate_json_to_pg.py --data-dir /app/data --merge-pool
+# 根目录 `python migrate_json_to_pg.py` 仍可用（兼容包装）
 ```
 
 本地非 Docker（需本机已有可连的 Postgres，或临时在 override 里映射端口）：
@@ -58,7 +59,8 @@ docker compose run --rm \
 ```bash
 pip install -r requirements.txt -r requirements-store.txt
 export DATABASE_URL=postgresql://grok2api:grok2api@127.0.0.1:5432/grok2api
-python migrate_json_to_pg.py --data-dir ./data --merge-pool
+python scripts/migrate_json_to_pg.py --data-dir ./data --merge-pool
+# 或：python migrate_json_to_pg.py --data-dir ./data --merge-pool
 ```
 
 ### 4. 启动应用
@@ -95,9 +97,9 @@ curl -fsS http://127.0.0.1:3000/health
 
 ## 场景 B：已是 hybrid，仅升级应用版本
 
-1. 备份 PostgreSQL  
-2. 拉取新镜像 / 源码并重建容器  
-3. 启动时 `store/pg.py` 会 **幂等执行 schema ALTER**（无需再跑 JSON 迁移）  
+1. 备份 PostgreSQL
+2. 拉取新镜像 / 源码并重建容器
+3. 启动时 `grok2api/store/pg.py` 会 **幂等执行 schema ALTER**（无需再跑 JSON 迁移）
 4. 检查 `/health` 与管理台
 
 ```bash
@@ -106,6 +108,28 @@ docker compose pull   # 若用 GHCR
 docker compose build
 docker compose up -d
 curl -fsS http://127.0.0.1:3000/health
+```
+
+---
+
+## 包结构迁移提示
+
+真实实现已收敛到 `grok2api/` 包内：
+
+- `grok2api/app.py`：FastAPI 应用主入口；根目录 `app.py` 只是兼容启动包装。
+- `grok2api/store/`：Redis / PostgreSQL 存储层；根目录 `store/` 只是兼容包装。
+- `grok2api/admin|pool|protocol|upstream/`：管理台、账号池、协议适配、上游集成。
+
+旧脚本里的根导入仍暂时兼容，但新代码建议改成包路径：
+
+```python
+# old
+import account_pool
+from store.pg import connection
+
+# new
+from grok2api.pool import account_pool
+from grok2api.store.pg import connection
 ```
 
 ---
@@ -120,11 +144,14 @@ curl -fsS http://127.0.0.1:3000/health
 ## 相关命令速查
 
 ```bash
-# dry-run 查看将导入什么
-python migrate_json_to_pg.py --data-dir ./data --dry-run
+# dry-run 查看将导入什么（推荐路径）
+python scripts/migrate_json_to_pg.py --data-dir ./data --dry-run
 
 # 只导入账号，跳过 keys
-python migrate_json_to_pg.py --data-dir ./data --skip-keys --merge-pool
+python scripts/migrate_json_to_pg.py --data-dir ./data --skip-keys --merge-pool
+
+# 根目录包装仍兼容旧命令
+python migrate_json_to_pg.py --data-dir ./data --dry-run
 
 # 健康与存储
 curl -s http://127.0.0.1:3000/health | jq .
